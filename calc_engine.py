@@ -5,6 +5,7 @@
 import datetime
 import calendar
 import sqlite3
+import traceback
 from typing import List, Dict, Any
 import config
 import db_manager
@@ -70,6 +71,18 @@ def recalculate_month(year_month: str, user_id: str):
             worker_id = worker["worker_id"]
             hire_date = worker["hire_date"].replace("-", "").replace("/", "")
             resignation_date = worker["resignation_date"].replace("-", "").replace("/", "") if worker["resignation_date"] else None
+            exclude_holiday = worker.get("exclude_holiday", 0) == 1
+            
+            # 만약 주월차 제외 근로자라면 이번 달의 기입된 모든 주차/월차 수치를 원천 클린업(0.0) 처리
+            if exclude_holiday:
+                cursor.execute("""
+                    UPDATE daily_attendance
+                    SET weekly_holiday = 0.0, monthly_holiday = 0.0,
+                        is_weekly_manual = 0, is_monthly_manual = 0,
+                        version = version + 1
+                    WHERE worker_id = ? AND substr(date, 1, 6) = ?
+                      AND (weekly_holiday != 0.0 OR monthly_holiday != 0.0 OR is_weekly_manual != 0 OR is_monthly_manual != 0);
+                """, (worker_id, year_month.replace("-", "")))
             
             # 해당 근로자의 이번 달 기존 일일 출역 데이터 로드
             cursor.execute("""
@@ -86,59 +99,8 @@ def recalculate_month(year_month: str, user_id: str):
                     
                 version = record["version"]
                 
-                # 입사일 이전 혹은 퇴사일 이후 인지 체크
-                is_invalid_period = False
-                if date_str < hire_date:
-                    is_invalid_period = True
-                if resignation_date and date_str > resignation_date:
-                    is_invalid_period = True
-                    
-                if is_invalid_period:
-                    # 입퇴사일 외 기간의 공수 데이터가 0이 아니면 0으로 강제 초기화 및 감사 로그 남김
-                    has_active_weights = (
-                        record["normal_weight"] > 0.0 or
-                        record["overtime_weight"] > 0.0 or
-                        record["lodging_weight"] > 0.0 or
-                        record["health_weight"] > 0.0 or
-                        record["leader_weight"] > 0.0 or
-                        record["weekly_holiday"] > 0.0 or
-                        record["monthly_holiday"] > 0.0
-                    )
-                    
-                    if has_active_weights:
-                        before_str = (
-                            f"일반:{record['normal_weight']}, 연장:{record['overtime_weight']}, "
-                            f"숙소:{record['lodging_weight']}, 보건:{record['health_weight']}, "
-                            f"팀장:{record['leader_weight']}, 주차:{record['weekly_holiday']}, "
-                            f"월차:{record['monthly_holiday']}"
-                        )
-                        
-                        cursor.execute("""
-                            UPDATE daily_attendance
-                            SET normal_weight = 0.0, overtime_weight = 0.0, lodging_weight = 0.0,
-                                health_weight = 0.0, leader_weight = 0.0, weekly_holiday = 0.0,
-                                monthly_holiday = 0.0, status = '휴무', version = version + 1
-                            WHERE date = ? AND worker_id = ?;
-                        """, (date_str, worker_id))
-                        
-                        cursor.execute("""
-                            DELETE FROM daily_custom_attendance
-                            WHERE date = ? AND worker_id = ?;
-                        """, (date_str, worker_id))
-                        
-                        # 시스템 자동초기화 감사로그
-                        db_manager.log_audit(
-                            user_id="SYSTEM",
-                            worker_id=worker_id,
-                            action="시스템 자동초기화(입퇴사일 제외 기간)",
-                            before_value=before_str,
-                            after_value="모든 공수 및 수당 0.0 초기화",
-                            conn=conn
-                        )
-                else:
-                    # 계약 기간 내인 경우에는 일일 루프 내에서 처리하지 않고
-                    # 아래에서 주차/월차를 주단위/월단위로 일괄 자동 계산합니다.
-                    pass
+                # 사용자가 직접 입력한 출역 데이터 및 누락 공수는 시스템이 임의로 삭제/초기화하지 않습니다.
+                pass
             
             # --- 2. 주차 계산 시작 ---
             # 해당 월의 모든 일요일 목록 추출
@@ -198,12 +160,12 @@ def recalculate_month(year_month: str, user_id: str):
                     rec = attendance_records.get(d_str)
                     if not rec and (d_str < date_list[0] or d_str > date_list[-1]):
                         rec = get_db_record(worker_id, d_str)
-                    if (rec and ((rec["normal_weight"] or 0.0) > 0.0 or rec.get("status") in EXCUSED_STATUSES)) or (d_str in holiday_dates):
+                    if (rec and ((rec["normal_weight"] or 0.0) > 0.0 or rec.get("status") in EXCUSED_STATUSES or (rec.get("monthly_holiday", 0.0) or 0.0) > 0.0)) or (d_str in holiday_dates):
                         worked_weekdays += 1
                 
                 if is_resigned_this_week:
                     # 중도 퇴사 주: 평일 출근일수 당 0.2씩 계산한 주차가 퇴사일에 달림
-                    weekly_val = round(0.2 * worked_weekdays, 2)
+                    weekly_val = 0.0 if exclude_holiday else round(0.2 * worked_weekdays, 2)
                     if resignation_date[:6] == year_month.replace("-", ""):
                         res_rec = attendance_records.get(resignation_date)
                         if res_rec:
@@ -235,7 +197,7 @@ def recalculate_month(year_month: str, user_id: str):
                                 
                 elif is_new_hire_this_week:
                     # 신규 입사 주: 평일 출근일수 당 0.2씩 계산하여 일요일에 달림
-                    weekly_val = round(0.2 * worked_weekdays, 2)
+                    weekly_val = 0.0 if exclude_holiday else round(0.2 * worked_weekdays, 2)
                     if sun_str[:6] == year_month.replace("-", ""):
                         sun_rec = attendance_records.get(sun_str)
                         if sun_rec:
@@ -272,11 +234,12 @@ def recalculate_month(year_month: str, user_id: str):
                                     rec = get_db_record(worker_id, d_str)
                                 normal_weight = rec["normal_weight"] if rec else 0.0
                                 status = rec["status"] if rec else ""
-                                if normal_weight <= 0.0 and status not in EXCUSED_STATUSES:
+                                monthly_h = rec.get("monthly_holiday", 0.0) if rec else 0.0
+                                if normal_weight <= 0.0 and status not in EXCUSED_STATUSES and monthly_h <= 0.0:
                                     is_perfect = False
                                     break
                                     
-                    weekly_val = 1.0 if is_perfect else 0.0
+                    weekly_val = 0.0 if exclude_holiday else (1.0 if is_perfect else 0.0)
                     if sun_str[:6] == year_month.replace("-", ""):
                         sun_rec = attendance_records.get(sun_str)
                         if sun_rec:
@@ -323,30 +286,52 @@ def recalculate_month(year_month: str, user_id: str):
                     if (rec and ((rec["normal_weight"] or 0.0) > 0.0 or rec.get("status") in EXCUSED_STATUSES)) or (date_str in holiday_dates):
                         worked_weekdays_month += 1
             
+            is_before_hire = (year_month.replace("-", "") < hire_date[:6])
+
             # 월차 값 결정
-            if is_resigned_this_month:
+            if is_before_hire:
+                # 입사월 이전인 경우: 월차 발생 안함 (0.0)
+                monthly_val = 0.0
+                target_date_str = date_list[-1]
+            elif is_resigned_this_month:
                 # 중도 퇴사한 달: 평일 출근일수 당 0.05씩 퇴사일에 부여 (최대 1.0)
-                monthly_val = min(1.0, round(0.05 * worked_weekdays_month, 2))
+                monthly_val = 0.0 if exclude_holiday else min(1.0, round(0.05 * worked_weekdays_month, 2))
                 target_date_str = resignation_date
             elif is_new_hire_this_month:
                 # 신규 입사한 달: 평일 출근일수 당 0.05씩 월말일에 부여 (최대 1.0)
-                monthly_val = min(1.0, round(0.05 * worked_weekdays_month, 2))
+                monthly_val = 0.0 if exclude_holiday else min(1.0, round(0.05 * worked_weekdays_month, 2))
                 target_date_str = date_list[-1]
             else:
                 # 그 외 모든 근로자: 평일 결근 발생 시 0.0, 평일 만근 시 1.0
                 is_perfect_month = True
+                has_valid_working_day = False
                 for date_str in date_list:
                     if is_working_weekday(date_str, holiday_dates):
                         if hire_date <= date_str and (not resignation_date or date_str <= resignation_date):
+                            has_valid_working_day = True
                             rec = attendance_records.get(date_str)
                             normal_weight = rec["normal_weight"] if rec else 0.0
                             status = rec["status"] if rec else ""
-                            if normal_weight <= 0.0 and status not in EXCUSED_STATUSES:
+                            monthly_h = rec.get("monthly_holiday", 0.0) if rec else 0.0
+                            if normal_weight <= 0.0 and status not in EXCUSED_STATUSES and monthly_h <= 0.0:
                                 is_perfect_month = False
                                 break
-                monthly_val = 1.0 if is_perfect_month else 0.0
+                if not has_valid_working_day:
+                    is_perfect_month = False
+                monthly_val = 0.0 if exclude_holiday else (1.0 if is_perfect_month else 0.0)
                 target_date_str = date_list[-1]
                 
+            # 월중 다른 날에 월차수당(monthly_holiday > 0)이 기입되어 있는지 체크
+            has_other_monthly = False
+            for date_str in date_list:
+                if date_str != target_date_str:
+                    rec = attendance_records.get(date_str)
+                    if rec and (rec.get("monthly_holiday", 0.0) or 0.0) > 0.0:
+                        has_other_monthly = True
+                        break
+            if has_other_monthly:
+                monthly_val = 0.0
+
             # 월차 값 기입 및 다른 일자 클린업
             for date_str in date_list:
                 is_target = (date_str == target_date_str)
@@ -377,47 +362,79 @@ def recalculate_month(year_month: str, user_id: str):
                         }
                         
             # --- 4. 보건수당 계산 시작 ---
-            # 보건 수당은 주민번호 뒷자리가 2로 시작하는 근로자 중, 월 근로일수가 15일 이상인 경우, 월말에 1일 생성, 그외는 0
-            clean_id = worker_id.replace("-", "")
-            is_female = (len(clean_id) >= 7 and clean_id[6] == '2')
-            
-            cursor.execute("""
-                SELECT SUM(normal_weight) as worked_days
-                FROM daily_attendance
-                WHERE worker_id = ? AND substr(date, 1, 6) = ?;
-            """, (worker_id, year_month.replace("-", "")))
-            w_days_row = cursor.fetchone()
-            worked_days_val = w_days_row["worked_days"] or 0.0
-            
-            health_val = 1.0 if (is_female and worked_days_val >= 15.0) else 0.0
-            health_target_date = date_list[-1]
-            
-            for date_str in date_list:
-                is_h_target = (date_str == health_target_date)
-                h_val = health_val if is_h_target else 0.0
-                rec = attendance_records.get(date_str)
-                if rec:
-                    if rec["health_weight"] != h_val:
-                        before_val = f"보건:{rec['health_weight']}"
+            # 여성근로자(주민번호 7번째 자리 2 또는 4) 대상:
+            # - 퇴사자: 퇴사일까지 평일 근로 15일 이상 시 퇴사날에 보건수당 1.0 부여, 15일 미만 시 0.0
+            # - 재직자: 해당 월 전체 근로 15일 이상 시 마지막 토요일에 보건수당 1.0 부여, 15일 미만 시 0.0
+            # 단, 보건수당이 월 중에 이미 입력된 경우(health_weight > 0.0) 자동계산으로 덮어쓰거나 수정하지 않습니다.
+            has_existing_health = any((rec.get("health_weight", 0.0) or 0.0) > 0.0 for rec in attendance_records.values())
+
+            if not has_existing_health:
+                clean_id = worker_id.replace("-", "")
+                is_female = (len(clean_id) >= 7 and clean_id[6] in ('2', '4'))
+                is_resigned_this_month = (resignation_date is not None and resignation_date[:6] == year_month.replace("-", ""))
+                
+                health_target_date = None
+                health_val = 0.0
+
+                if is_female and not exclude_holiday:
+                    if is_resigned_this_month:
+                        resignation_clean = resignation_date.replace("-", "").replace("/", "").strip()
                         cursor.execute("""
-                            UPDATE daily_attendance 
-                            SET health_weight = ?, version = version + 1 
-                            WHERE date = ? AND worker_id = ?;
-                        """, (h_val, date_str, worker_id))
-                        rec["health_weight"] = h_val
-                        db_manager.log_audit("SYSTEM", worker_id, f"{date_str} 보건수당 자동 계산 반영", before_val, f"보건:{h_val}", conn=conn)
-                else:
-                    if h_val > 0.0:
+                            SELECT SUM(normal_weight) as worked_days
+                            FROM daily_attendance
+                            WHERE worker_id = ? AND substr(date, 1, 6) = ? AND date <= ?;
+                        """, (worker_id, year_month.replace("-", ""), resignation_clean))
+                        w_days_row = cursor.fetchone()
+                        worked_days_val = w_days_row["worked_days"] or 0.0
+                        
+                        if worked_days_val >= 15.0:
+                            health_target_date = resignation_clean
+                            health_val = 1.0
+                    else:
                         cursor.execute("""
-                            INSERT INTO daily_attendance (date, worker_id, normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight, weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, version)
-                            VALUES (?, ?, 0.0, 0.0, 0.0, ?, 0.0, 0.0, 0.0, '휴무', 0, 0, 1);
-                        """, (date_str, worker_id, h_val))
-                        db_manager.log_audit("SYSTEM", worker_id, f"{date_str} 보건수당 신규 삽입 반영", "보건:없음", f"보건:{h_val}", conn=conn)
-                        attendance_records[date_str] = {
-                            "date": date_str, "worker_id": worker_id, "normal_weight": 0.0, "overtime_weight": 0.0,
-                            "lodging_weight": 0.0, "health_weight": h_val, "leader_weight": 0.0, "weekly_holiday": 0.0,
-                            "monthly_holiday": 0.0, "status": "휴무", "is_weekly_manual": 0, "is_monthly_manual": 0, "version": 1
-                        }
+                            SELECT SUM(normal_weight) as worked_days
+                            FROM daily_attendance
+                            WHERE worker_id = ? AND substr(date, 1, 6) = ?;
+                        """, (worker_id, year_month.replace("-", "")))
+                        w_days_row = cursor.fetchone()
+                        worked_days_val = w_days_row["worked_days"] or 0.0
+                        
+                        if worked_days_val >= 15.0:
+                            for date_str in reversed(date_list):
+                                dt_obj = datetime.date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
+                                if dt_obj.weekday() == 5:
+                                    health_target_date = date_str
+                                    break
+                            if not health_target_date:
+                                health_target_date = date_list[-1]
+                            health_val = 1.0
+
+                for date_str in date_list:
+                    is_h_target = (health_target_date is not None and date_str == health_target_date)
+                    h_val = health_val if is_h_target else 0.0
+                    rec = attendance_records.get(date_str)
+                    if rec:
+                        if rec["health_weight"] != h_val:
+                            before_val = f"보건:{rec['health_weight']}"
+                            cursor.execute("""
+                                UPDATE daily_attendance 
+                                SET health_weight = ?, version = version + 1 
+                                WHERE date = ? AND worker_id = ?;
+                            """, (h_val, date_str, worker_id))
+                            rec["health_weight"] = h_val
+                            db_manager.log_audit("SYSTEM", worker_id, f"{date_str} 보건수당 자동 계산 반영", before_val, f"보건:{h_val}", conn=conn)
+                    else:
+                        if h_val > 0.0:
+                            cursor.execute("""
+                                INSERT INTO daily_attendance (date, worker_id, normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight, weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, version)
+                                VALUES (?, ?, 0.0, 0.0, 0.0, ?, 0.0, 0.0, 0.0, '휴무', 0, 0, 1);
+                            """, (date_str, worker_id, h_val))
+                            db_manager.log_audit("SYSTEM", worker_id, f"{date_str} 보건수당 신규 삽입 반영", "보건:없음", f"보건:{h_val}", conn=conn)
+                            attendance_records[date_str] = {
+                                "date": date_str, "worker_id": worker_id, "normal_weight": 0.0, "overtime_weight": 0.0,
+                                "lodging_weight": 0.0, "health_weight": h_val, "leader_weight": 0.0, "weekly_holiday": 0.0,
+                                "monthly_holiday": 0.0, "status": "휴무", "is_weekly_manual": 0, "is_monthly_manual": 0, "version": 1
+                            }
                         
             # 5. 인물별 월별 집계(monthly_status) 갱신
             cursor.execute("""
@@ -452,3 +469,12 @@ def recalculate_month(year_month: str, user_id: str):
         raise e
     finally:
         conn.close()
+
+
+def recalculate_monthly_holidays(year_month: str, user_id: str = "SYSTEM", conn=None):
+    """주차/월차/보건 수당 호환용 래퍼 함수"""
+    return recalculate_month(year_month, user_id)
+
+def recalculate_health_allowances(year_month: str, user_id: str = "SYSTEM", conn=None):
+    """보건 수당 호환용 래퍼 함수"""
+    return recalculate_month(year_month, user_id)

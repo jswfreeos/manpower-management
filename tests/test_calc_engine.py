@@ -78,9 +78,9 @@ def test_recalculate_month():
     
     conn = db_manager.get_db_connection()
     
-    # 입사일 이전 데이터 초기화 검증
+    # 입사일 이전 사용자 입력 데이터 보존 검증 (시스템 임의 초기화 방지 규칙 적용)
     row_invalid = conn.execute("SELECT * FROM daily_attendance WHERE date='20260705' AND worker_id='W001';").fetchone()
-    assert row_invalid["normal_weight"] == 0.0
+    assert row_invalid["normal_weight"] == 1.0
     
     # 신규 입사 주 (7/10 금요일 입사, 평일 중 금요일 1일 근무)
     # 7/12 일요일 주차는 0.2 * 1 = 0.2
@@ -96,4 +96,39 @@ def test_recalculate_month():
     # 퇴사일(7/20) 월차는 0.05 * 3 = 0.15
     assert row_resign["monthly_holiday"] == 0.15
     
+    conn.close()
+
+def test_health_allowance_preservation():
+    """월 중 이미 입력된 보건수당 덮어쓰기 방지 검증"""
+    # female worker (주민번호 2 포함)
+    worker = [{
+        "worker_id": "900101-2000000",
+        "name": "여성근로자",
+        "has_lodging": 0,
+        "has_health": 0,
+        "is_team_leader": 0,
+        "hire_date": "2026-07-01",
+        "resignation_date": None,
+        "team": "현장팀",
+        "trade": "잡무"
+    }]
+    db_manager.bulk_insert_workers(worker, "SYSTEM")
+
+    # 월 중 특정 일자(20260715)에 보건수당 1.0 직접 기입
+    attendance = [
+        {"date": "20260715", "worker_id": "900101-2000000", "normal_weight": 1.0, "health_weight": 1.0, "status": "출근", "version": 1}
+    ]
+    db_manager.save_attendance_bulk(attendance, "SYSTEM")
+
+    # 월말 recalculate_month 실행
+    calc_engine.recalculate_month("2026-07", "TEST_USER")
+
+    conn = db_manager.get_db_connection()
+    # 20260715의 보건수당 1.0 보존 확인 (0.0으로 초기화되지 않음)
+    row_mid = conn.execute("SELECT * FROM daily_attendance WHERE date='20260715' AND worker_id='900101-2000000';").fetchone()
+    assert row_mid["health_weight"] == 1.0
+
+    # 마지막 토요일(20260725)에 중복 자동 생성되지 않음 확인
+    row_sat = conn.execute("SELECT * FROM daily_attendance WHERE date='20260725' AND worker_id='900101-2000000';").fetchone()
+    assert row_sat is None or row_sat["health_weight"] == 0.0
     conn.close()

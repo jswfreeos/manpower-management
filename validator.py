@@ -29,7 +29,8 @@ def audit_monthly_data(year_month: str) -> Dict[str, List[Dict[str, Any]]]:
         JOIN workers w ON a.worker_id = w.worker_id
         WHERE substr(a.date, 1, 6) = ? 
           AND a.normal_weight = 0.0 
-          AND a.overtime_weight > 0.0;
+          AND a.overtime_weight > 0.0
+          AND (a.prev_month_missing IS NULL OR a.prev_month_missing = 0.0);
     """, (ym_db,))
     anomalies["omitted_attendance"] = [dict(r) for r in cursor.fetchall()]
     

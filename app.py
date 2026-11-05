@@ -16,6 +16,20 @@ import db_manager
 import calc_engine
 import validator
 import excel_io
+
+# 다이얼로그 상태 및 라이프사이클 동기화 콜백
+def set_dialog_rerun_callback():
+    st.session_state.is_dialog_rerun = True
+
+if "dialog_open" not in st.session_state:
+    st.session_state.dialog_open = False
+
+if st.session_state.dialog_open:
+    # 다이얼로그 내부 조작 리런이 아닌 경우(외부 클릭 후 부모 위젯 작동 등) 닫기 상태로 동기화
+    if not st.session_state.get("is_dialog_rerun", False):
+        st.session_state.dialog_open = False
+    else:
+        st.session_state.is_dialog_rerun = False
 # Page configuration
 st.set_page_config(
     page_title="대선이엔씨 - 노무 관리 시스템",
@@ -173,7 +187,7 @@ def get_attendance_grid(year_month: str) -> Tuple[List[Dict[str, Any]], List[Dic
     conn = db_manager.get_db_connection()
     cursor = conn.cursor()
     # 근로자 목록
-    cursor.execute("SELECT worker_id, name, team, trade FROM workers ORDER BY name ASC;")
+    cursor.execute("SELECT worker_id, name, team, trade, resignation_date FROM workers ORDER BY name ASC;")
     workers = [dict(r) for r in cursor.fetchall()]
     # 출역 정보 (한/일 일치화 하도록 한 번에 조회)
     cursor.execute("""
@@ -219,7 +233,8 @@ def get_attendance_grid(year_month: str) -> Tuple[List[Dict[str, Any]], List[Dic
 @st.dialog("공수 편집창 (전체 근로자)", width="large")
 def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowances, hide_allowances, default_edit_dim):
     st.subheader("📝 전체 근로자 공수 편집")
-    st.write("모든 근로자의 공수 및 수당을 페이지 분할 없이 한 화면에서 입력/수정할 수 있습니다.")
+    st.write("모든 근로자의 공수 및 수당을 한 화면에서 빠르게 입력하고 수정할 수 있습니다.")
+    
     # 1. 차원 선택
     choices = ["일반공수", "출역구분", "연장공수", "전월 누락공수", "차감공수", "주차수당", "월차수당", "숙소수당", "보건수당", "팀장수당"] + [f"{cat['display_name']}수당" for cat in custom_allowances]
     initial_idx = choices.index(default_edit_dim) if default_edit_dim in choices else 0
@@ -228,7 +243,8 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
         choices,
         index=initial_idx,
         horizontal=True,
-        key="dialog_edit_dim"
+        key="dialog_edit_dim",
+        on_change=set_dialog_rerun_callback
     )
     dim_key_map = {
         "일반공수": "normal_weight",
@@ -245,18 +261,34 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
     for cat in custom_allowances:
         dim_key_map[f"{cat['display_name']}수당"] = f"custom_{cat['type_id']}"
     dim_key = dim_key_map.get(edit_dim)
+    
+    # 에디터 상태 버전 관리를 통한 저장 후 세션 동기화
+    editor_rev = st.session_state.get("editor_rev", 0)
+    editor_key = f"dialog_editor_{ym}_{edit_dim}_{editor_rev}"
+
     # 2. 데이터 그리드 빌드 (전체 근로자 대상)
     grid_data = []
     for w in workers:
+        r_date_raw = w.get("resignation_date")
+        if r_date_raw:
+            r_clean = str(r_date_raw).replace("-", "").replace("/", "").strip()
+            if len(r_clean) >= 8:
+                status_disp = f"🔴 퇴사 ({r_clean[4:6]}/{r_clean[6:8]})"
+            else:
+                status_disp = f"🔴 퇴사 ({r_date_raw})"
+        else:
+            status_disp = "재직"
         row = {
             "주민번호": w["worker_id"],
             "성명": w["name"],
+            "상태": status_disp,
             "소속팀": w["team"] or "",
             "직종": w["trade"] or ""
         }
         tot_normal = 0.0
         tot_overtime = 0.0
         tot_prev_missing = 0.0
+        tot_deduction = 0.0
         tot_weekly = 0.0
         tot_monthly = 0.0
         tot_lodging = 0.0
@@ -269,6 +301,7 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
             normal_val = 0.0
             over_val = 0.0
             prev_missing_val = 0.0
+            deduction_val = 0.0
             weekly_val = 0.0
             monthly_val = 0.0
             lodging_val = 0.0
@@ -280,6 +313,7 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
                 normal_val = rec.get("normal_weight", 0.0) or 0.0
                 over_val = rec.get("overtime_weight", 0.0) or 0.0
                 prev_missing_val = rec.get("prev_month_missing", 0.0) or 0.0
+                deduction_val = rec.get("deduction", 0.0) or 0.0
                 weekly_val = rec.get("weekly_holiday", 0.0) or 0.0
                 monthly_val = rec.get("monthly_holiday", 0.0) or 0.0
                 lodging_val = rec.get("lodging_weight", 0.0) or 0.0
@@ -290,13 +324,25 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
             tot_normal += normal_val
             tot_overtime += over_val
             tot_prev_missing += prev_missing_val
+            tot_deduction += deduction_val
             tot_weekly += weekly_val
             tot_monthly += monthly_val
             tot_lodging += lodging_val
             tot_health += health_val
             tot_leader += leader_val
             tot_custom += custom_val
-            if key in versions:
+            if edit_dim == "적용 수당 요약":
+                allowance_tags = []
+                if weekly_val > 0: allowance_tags.append("주차")
+                if monthly_val > 0: allowance_tags.append("월차")
+                if lodging_val > 0: allowance_tags.append("숙소")
+                if health_val > 0: allowance_tags.append("보건")
+                if leader_val > 0: allowance_tags.append("팀장")
+                for cat in custom_allowances:
+                    c_val = float(versions.get(key, {}).get("custom_" + cat["type_id"], 0.0) or 0.0)
+                    if c_val > 0: allowance_tags.append(cat["display_name"])
+                row[day_col] = ", ".join(allowance_tags) if allowance_tags else ""
+            elif key in versions:
                 val = versions[key].get(dim_key)
                 if dim_key == "status":
                     row[day_col] = str(val) if (val and val != "휴무" and val != "None") else ""
@@ -304,10 +350,10 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
                     row[day_col] = float(val) if val is not None else 0.0
             else:
                 row[day_col] = "" if dim_key == "status" else 0.0
-        # 우측 합계 열 기입 (편집할 때도 읽기 전용 참고용)
         row["출역"] = tot_normal
         row["연장"] = tot_overtime
         row["누락"] = tot_prev_missing
+        row["차감"] = tot_deduction
         row["주차"] = tot_weekly
         row["월차"] = tot_monthly
         if not hide_allowances:
@@ -315,11 +361,10 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
             row["보건"] = tot_health
             row["팀장"] = tot_leader
             row["기타"] = tot_custom
-            row["총공수"] = tot_normal + tot_overtime + tot_prev_missing + tot_weekly + tot_monthly + tot_lodging + tot_health + tot_leader + tot_custom
+            row["총공수"] = tot_normal + tot_overtime + tot_prev_missing - tot_deduction + tot_weekly + tot_monthly + tot_lodging + tot_health + tot_leader + tot_custom
         else:
-            row["총공수"] = tot_normal + tot_overtime + tot_prev_missing + tot_weekly + tot_monthly
+            row["총공수"] = tot_normal + tot_overtime + tot_prev_missing - tot_deduction + tot_weekly + tot_monthly
         grid_data.append(row)
-    # 일일 합계 행 계산 및 추가
     if grid_data:
         total_row = {
             "주민번호": "일일 합계",
@@ -335,6 +380,7 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
         total_row["출역"] = round(sum(float(r["출역"]) for r in grid_data if "출역" in r), 2)
         total_row["연장"] = round(sum(float(r["연장"]) for r in grid_data if "연장" in r), 2)
         total_row["누락"] = round(sum(float(r["누락"]) for r in grid_data if "누락" in r), 2)
+        total_row["차감"] = round(sum(float(r["차감"]) for r in grid_data if "차감" in r), 2)
         total_row["주차"] = round(sum(float(r["주차"]) for r in grid_data if "주차" in r), 2)
         total_row["월차"] = round(sum(float(r["월차"]) for r in grid_data if "월차" in r), 2)
         if not hide_allowances:
@@ -347,12 +393,150 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
         grid_data.insert(0, copy.deepcopy(total_row))
         grid_data.append(copy.deepcopy(total_row))
     df_grid = pd.DataFrame(grid_data)
-    # 비활성화할 컬럼 리스트 정의
+
+    # 3. 공수 대량 저장 공통 헬퍼 함수
+    def save_changes():
+        state = st.session_state.get(editor_key)
+        if state and state.get("edited_rows"):
+            edited_rows = state["edited_rows"]
+            records_to_update = []
+            conn = db_manager.get_db_connection()
+            cursor = conn.cursor()
+            try:
+                for row_idx, changes in edited_rows.items():
+                    row_orig = df_grid.iloc[int(row_idx)]
+                    worker_id = row_orig["주민번호"]
+                    if worker_id == "일일 합계":
+                        continue
+                    cursor.execute("SELECT has_lodging, has_health, is_team_leader FROM workers WHERE worker_id = ?;", (worker_id,))
+                    worker_row = cursor.fetchone()
+                    worker = dict(worker_row) if worker_row else {}
+                    for col_name, new_val in changes.items():
+                        if col_name not in styled_days:
+                            continue
+                        day_idx = styled_days.index(col_name)
+                        date_str = dates[day_idx]
+                        try:
+                            if dim_key == "status":
+                                new_weight = str(new_val)
+                                if new_weight == "" or new_weight == "None":
+                                    new_weight = "휴무"
+                            else:
+                                new_weight = float(new_val)
+                                if dim_key in ["normal_weight", "overtime_weight"]:
+                                    if new_weight < config.ALLOWED_MIN_WEIGHT or new_weight > config.ALLOWED_MAX_WEIGHT:
+                                        raise ValueError(f"값 범위 제약(0.0 ~ 2.0)을 벗어났습니다. 입력값: {new_weight}")
+                        except ValueError as val_err:
+                            st.error(f"입력 오류: {col_name}의 값이 올바르지 않습니다. ({val_err})")
+                            st.stop()
+                        cursor.execute("""
+                            SELECT * FROM daily_attendance
+                            WHERE date = ? AND worker_id = ?;
+                        """, (date_str, worker_id))
+                        db_row = cursor.fetchone()
+                        if dim_key.startswith("custom_"):
+                            type_id = dim_key[7:]
+                            if not db_row:
+                                def_l = 1.0 if worker.get("has_lodging") == 1 else 0.0
+                                def_h = 1.0 if worker.get("has_health") == 1 else 0.0
+                                def_le = 1.0 if worker.get("is_team_leader") == 1 else 0.0
+                                cursor.execute("""
+                                    INSERT INTO daily_attendance (
+                                        date, worker_id, normal_weight, overtime_weight, lodging_weight, 
+                                        health_weight, leader_weight, weekly_holiday, monthly_holiday, status, version
+                                    )
+                                    VALUES (?, ?, 0.0, 0.0, ?, ?, ?, 0.0, 0.0, '출근', 1);
+                                """, (date_str, worker_id, def_l, def_h, def_le))
+                            db_manager.save_daily_custom_attendance(date_str, worker_id, type_id, new_weight, conn=conn)
+                            db_manager.log_audit(
+                                user_id=st.session_state.user_id,
+                                worker_id=worker_id,
+                                action=f"{date_str} 커스텀 수당({type_id}) 가중치 수정",
+                                before_value="이전 상태",
+                                after_value=f"가중치:{new_weight}",
+                                conn=conn
+                            )
+                        else:
+                            record = {
+                                "date": date_str,
+                                "worker_id": worker_id,
+                                "normal_weight": 0.0,
+                                "overtime_weight": 0.0,
+                                "lodging_weight": 0.0,
+                                "health_weight": 0.0,
+                                "leader_weight": 0.0,
+                                "weekly_holiday": 0.0,
+                                "monthly_holiday": 0.0,
+                                "is_weekly_manual": 0,
+                                "is_monthly_manual": 0,
+                                "prev_month_missing": 0.0,
+                                "deduction": 0.0,
+                                "status": "휴무",
+                                "version": 1
+                            }
+                            if db_row:
+                                record.update(dict(db_row))
+                            record[dim_key] = new_weight
+                            if dim_key == "weekly_holiday":
+                                record["is_weekly_manual"] = 1
+                            elif dim_key == "monthly_holiday":
+                                record["is_monthly_manual"] = 1
+                            if dim_key == "normal_weight":
+                                if record["normal_weight"] > 0.0:
+                                    record["status"] = "출근"
+                                else:
+                                    cur_status = record.get("status")
+                                    if cur_status == "출근" or not cur_status or cur_status == "None":
+                                        record["status"] = "휴무"
+                            records_to_update.append(record)
+                conn.commit()
+                if records_to_update:
+                    db_manager.save_attendance_bulk(records_to_update, st.session_state.user_id)
+                get_attendance_grid.clear()
+                # 세션 키 리셋 및 버전 업을 통한 중복 저장/동시성 에러 완전 방지
+                if editor_key in st.session_state:
+                    del st.session_state[editor_key]
+                st.session_state["editor_rev"] = editor_rev + 1
+                return True
+            except Exception as e:
+                st.error(f"저장 중 오류 발생: {e}")
+                return False
+            finally:
+                conn.close()
+        return None
+
+    # 4. 다이얼로그 전용 제어 버튼 바 (상단 단일 배치 - 중복 버튼 제거)
+    col_t1, col_t2, col_t3 = st.columns([1, 1, 1])
+    with col_t1:
+        if st.button("💾 변경사항 반영 (창 유지)", key="btn_apply_top", use_container_width=True):
+            st.session_state.is_dialog_rerun = True
+            st.session_state.dialog_open = True
+            res = save_changes()
+            if res is True:
+                st.success("변경 사항이 성공적으로 저장되었습니다!")
+                st.rerun()
+            elif res is None:
+                st.info("수정된 내역이 없습니다.")
+    with col_t2:
+        if st.button("💾 반영 후 닫기", key="btn_save_close_top", use_container_width=True, type="primary"):
+            st.session_state.dialog_open = False
+            st.session_state.is_dialog_rerun = False
+            res = save_changes()
+            if res is True or res is None:
+                st.rerun()
+    with col_t3:
+        if st.button("❌ 반영하지 않고 닫기", key="btn_close_top", use_container_width=True):
+            st.session_state.dialog_open = False
+            st.session_state.is_dialog_rerun = False
+            st.rerun()
+            
+    st.markdown("---")
+
+    # 5. 그리드 데이터 에디터 바인딩
     disabled_cols = ["주민번호", "성명", "소속팀", "직종", "출역", "연장", "주차", "월차"]
     if not hide_allowances:
         disabled_cols += ["숙소", "보건", "팀장", "기타"]
     disabled_cols += ["총공수"]
-    # 틀고정 및 소수점 포맷 지정 설정 컬럼 빌드
     col_config = {
         "주민번호": st.column_config.TextColumn("주민번호", pinned=True),
         "성명": st.column_config.TextColumn("성명", pinned=True),
@@ -370,129 +554,36 @@ def show_edit_dialog(ym, workers, dates, styled_days, versions, custom_allowance
     summary_num_cols = ["출역", "연장", "주차", "월차", "숙소", "보건", "팀장", "기타", "총공수"]
     for col in summary_num_cols:
         col_config[col] = st.column_config.NumberColumn(col, format="%.2f")
-    editor_key = f"dialog_editor_{ym}_{edit_dim}"
+
     edited_df = st.data_editor(
-        df_grid, # 편집 모드이므로 Styler 버그 방지를 위해 raw df 전달
+        df_grid,
         disabled=disabled_cols,
         column_config=col_config,
         key=editor_key,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        on_change=set_dialog_rerun_callback
     )
-    st.markdown("---")
-    col_db1, col_db2 = st.columns([1, 1])
-    with col_db1:
-        if st.button("💾 변경 사항 저장 및 닫기", use_container_width=True, type="primary"):
-            state = st.session_state.get(editor_key)
-            if state and state.get("edited_rows"):
-                edited_rows = state["edited_rows"]
-                records_to_update = []
-                conn = db_manager.get_db_connection()
-                cursor = conn.cursor()
-                try:
-                    for row_idx, changes in edited_rows.items():
-                        row_orig = df_grid.iloc[int(row_idx)]
-                        worker_id = row_orig["주민번호"]
-                        if worker_id == "일일 합계":
-                            continue
-                        # DB 매칭을 위해 원본 근로자 정보 가져오기
-                        cursor.execute("SELECT has_lodging, has_health, is_team_leader FROM workers WHERE worker_id = ?;", (worker_id,))
-                        worker_row = cursor.fetchone()
-                        worker = dict(worker_row) if worker_row else {}
-                        for col_name, new_val in changes.items():
-                            if col_name not in styled_days:
-                                continue
-                            day_idx = styled_days.index(col_name)
-                            date_str = dates[day_idx]
-                            try:
-                                if dim_key == "status":
-                                    new_weight = str(new_val)
-                                    if new_weight == "" or new_weight == "None":
-                                        new_weight = "휴무"
-                                else:
-                                    new_weight = float(new_val)
-                                    if new_weight < config.ALLOWED_MIN_WEIGHT or new_weight > config.ALLOWED_MAX_WEIGHT:
-                                        raise ValueError(f"값 범위 제약(0.0 ~ 2.0)을 벗어났습니다. 입력값: {new_weight}")
-                            except ValueError as val_err:
-                                st.error(f"입력 오류: {col_name}의 값이 올바르지 않습니다. ({val_err})")
-                                st.stop()
-                            cursor.execute("""
-                                SELECT normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight, version
-                                FROM daily_attendance
-                                WHERE date = ? AND worker_id = ?;
-                            """, (date_str, worker_id))
-                            db_row = cursor.fetchone()
-                            if dim_key.startswith("custom_"):
-                                type_id = dim_key[7:]
-                                if not db_row:
-                                    def_l = 1.0 if worker.get("has_lodging") == 1 else 0.0
-                                    def_h = 1.0 if worker.get("has_health") == 1 else 0.0
-                                    def_le = 1.0 if worker.get("is_team_leader") == 1 else 0.0
-                                    cursor.execute("""
-                                        INSERT INTO daily_attendance (
-                                            date, worker_id, normal_weight, overtime_weight, lodging_weight, 
-                                            health_weight, leader_weight, weekly_holiday, monthly_holiday, status, version
-                                        )
-                                        VALUES (?, ?, 0.0, 0.0, ?, ?, ?, 0.0, 0.0, '출근', 1);
-                                    """, (date_str, worker_id, def_l, def_h, def_le))
-                                db_manager.save_daily_custom_attendance(date_str, worker_id, type_id, new_weight, conn=conn)
-                                db_manager.log_audit(
-                                    user_id=st.session_state.user_id,
-                                    worker_id=worker_id,
-                                    action=f"{date_str} 커스텀 수당({type_id}) 가중치 수정",
-                                    before_value="이전 상태",
-                                    after_value=f"가중치:{new_weight}",
-                                    conn=conn
-                                )
-                            else:
-                                record = {
-                                    "date": date_str,
-                                    "worker_id": worker_id,
-                                    "normal_weight": 0.0,
-                                    "overtime_weight": 0.0,
-                                    "lodging_weight": 0.0,
-                                    "health_weight": 0.0,
-                                    "leader_weight": 0.0,
-                                    "weekly_holiday": 0.0,
-                                    "monthly_holiday": 0.0,
-                                    "is_weekly_manual": 0,
-                                    "is_monthly_manual": 0,
-                                    "status": "휴무",
-                                    "version": 1
-                                }
-                                if db_row:
-                                    record.update(dict(db_row))
-                                record[dim_key] = new_weight
-                                if dim_key == "weekly_holiday":
-                                    record["is_weekly_manual"] = 1
-                                elif dim_key == "monthly_holiday":
-                                    record["is_monthly_manual"] = 1
-                                # 일반공수 수정 시에만 출역 구분 자동 전환
-                                if dim_key == "normal_weight":
-                                    if record["normal_weight"] > 0.0:
-                                        record["status"] = "출근"
-                                    else:
-                                        # 수동으로 지정한 내역(병가, 휴가, 결근, 공가 등)이 지워지지 않도록
-                                        # 기존 구분이 '출근'이었거나 비어있던 경우에만 '휴무'로 전환합니다.
-                                        cur_status = record.get("status")
-                                        if cur_status == "출근" or not cur_status or cur_status == "None":
-                                            record["status"] = "휴무"
-                                records_to_update.append(record)
-                    if records_to_update:
-                        db_manager.save_attendance_bulk(records_to_update, st.session_state.user_id)
-                    st.success("성공적으로 변경 사항을 저장했습니다!")
-                    get_attendance_grid.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"저장 중 오류 발생: {e}")
-                finally:
-                    conn.close()
-            else:
-                st.info("수정된 행이 없어 그냥 종료합니다.")
-                st.rerun()
-    with col_db2:
-        if st.button("❌ 닫기 (저장하지 않음)", use_container_width=True):
-            st.rerun()
+
+def is_long_resigned_worker(resignation_date_str: str, active_ym: str) -> bool:
+    """
+    해당 월(active_ym, 예: '2026-08') 1일자 기준으로 
+    퇴사일이 1달 이상(30일 이상) 지난 장기 퇴사자인지 판별합니다.
+    """
+    if not resignation_date_str:
+        return False
+    r_clean = str(resignation_date_str).replace("-", "").replace("/", "").strip()
+    if len(r_clean) < 8:
+        return False
+    try:
+        r_dt = datetime.date(int(r_clean[:4]), int(r_clean[4:6]), int(r_clean[6:8]))
+        ym_clean = active_ym.replace("-", "")
+        first_day_of_active_month = datetime.date(int(ym_clean[:4]), int(ym_clean[4:6]), 1)
+        return (first_day_of_active_month - r_dt).days >= 30
+    except Exception:
+        return False
+
+
 # ----------------- Tab 1: 월간 공수 현황 및 편집 -----------------
 with tab_grid:
     st.subheader("📅 월간 공수 판넬")
@@ -501,36 +592,45 @@ with tab_grid:
     if not workers:
         st.warning("등록된 근로자가 없습니다. '근로자 관리 및 일괄등록' 탭에서 근로자를 먼저 등록해 주세요.")
     else:
+        # 해당월 1일자 기준 1달 이상 지나 공수입력에서 제외할 장기 퇴사자 분리
+        long_resigned_workers = [w for w in workers if is_long_resigned_worker(w.get("resignation_date"), st.session_state.selected_ym)]
+        active_entry_workers = [w for w in workers if not is_long_resigned_worker(w.get("resignation_date"), st.session_state.selected_ym)]
+        
+        # 기본적으로 장기 퇴사자는 공수입력 표에서 제외
+        display_workers = active_entry_workers
+        
         # 필터링 및 편집 창 열기 설정
-        col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
+        col_f1, col_f2, col_f3, col_f4 = st.columns([1, 1, 1.2, 1])
         # 1-1. 팀 필터
-        teams = sorted(list(set([w["team"] for w in workers if w["team"]])))
+        teams = sorted(list(set([w["team"] for w in display_workers if w["team"]])))
         with col_f1:
             sel_team = st.selectbox("팀 필터 (전체는 공란)", ["전체"] + teams)
         # 1-2. 직종 필터
-        trades = sorted(list(set([w["trade"] for w in workers if w["trade"]])))
+        trades = sorted(list(set([w["trade"] for w in display_workers if w["trade"]])))
         with col_f2:
             sel_trade = st.selectbox("직종 필터 (전체는 공란)", ["전체"] + trades)
         # 1-3. 편집창 오픈 버튼 배치
         with col_f3:
             open_edit = st.button("✏️ 전체 근로자 공수 편집창 열기", type="primary", use_container_width=True, disabled=is_locked)
+        # 1-4. 최신 데이터 동기화/새로고침 버튼 배치
+        with col_f4:
+            if st.button("🔄 최신 데이터 새로고침", use_container_width=True, help="데이터베이스의 최신 공수 내역을 다시 불러옵니다."):
+                get_attendance_grid.clear()
+                st.toast("🔄 최신 공수 데이터를 성공적으로 다시 불러왔습니다!")
+                st.rerun()
         # 필터링 적용
-        filtered_workers = workers
+        filtered_workers = display_workers
         if sel_team != "전체":
             filtered_workers = [w for w in filtered_workers if w["team"] == sel_team]
         if sel_trade != "전체":
             filtered_workers = [w for w in filtered_workers if w["trade"] == sel_trade]
         # 2. 편집 차원 선택 및 숨김 체크박스 레이아웃
-        choices = ["총 공수", "일반공수", "출역구분", "연장공수", "전월 누락공수", "차감공수", "주차수당", "월차수당", "숙소수당", "보건수당", "팀장수당"] + [f"{cat['display_name']}수당" for cat in custom_allowances]
-        col_dim_radio, col_dim_chk = st.columns([4, 1])
-        with col_dim_radio:
-            edit_dim = st.radio(
-                "📍 조회 및 편집할 공수 차원 선택",
-                choices,
-                horizontal=True
-            )
-        with col_dim_chk:
-            hide_allowances = st.checkbox("숨김 설정: 숙소/보건/팀장/기타 열 제외", value=False)
+        choices = ["총 공수", "일반공수", "출역구분", "적용 수당 요약", "연장공수", "전월 누락공수", "차감공수", "주차수당", "월차수당", "숙소수당", "보건수당", "팀장수당"] + [f"{cat['display_name']}수당" for cat in custom_allowances]
+        col_c1, col_c2 = st.columns([3, 1])
+        with col_c1:
+            edit_dim = st.radio("📍 메인 공수 표 칼럼 표시 모드", choices, horizontal=True, key="main_grid_edit_dim")
+        with col_c2:
+            hide_allowances = st.checkbox("🙈 숙소/보건/팀장/기타 수당 숨기기", value=False)
         dim_key_map = {
             "일반공수": "normal_weight",
             "출역구분": "status",
@@ -545,17 +645,22 @@ with tab_grid:
         }
         for cat in custom_allowances:
             dim_key_map[f"{cat['display_name']}수당"] = f"custom_{cat['type_id']}"
-        dim_key = dim_key_map.get(edit_dim)
-        # 공휴일 목록 조회 (토/일/공휴일 표시용 헤더 빌드)
-        holidays_list = db_manager.get_holidays(st.session_state.selected_ym)
-        holiday_dates = [h["date"] for h in holidays_list]
-        # 헤더 리스트 빌드 (이모지 기호는 제거하고 깔끔한 일자만 표시)
+        dim_key = dim_key_map.get(edit_dim, "normal_weight")
+        korean_weekdays = ["월", "화", "수", "목", "금", "토", "일"]
         styled_days = []
-        for d_str in dates:
-            day_num = int(d_str[6:8])
-            styled_days.append(f"{day_num}일")
+        for d in dates:
+            day_num = int(d[6:8])
+            dt = datetime.date(int(d[:4]), int(d[4:6]), day_num)
+            w_str = korean_weekdays[dt.weekday()]
+            styled_days.append(f"{day_num}일({w_str})")
+        holiday_dates = set(db_manager.get_holidays(st.session_state.selected_ym))
+
         # 편집 모달 열기 요청 처리
         if open_edit:
+            st.session_state.dialog_open = True
+            st.session_state.is_dialog_rerun = True
+            
+        if st.session_state.get("dialog_open", False):
             show_edit_dialog(
                 ym=st.session_state.selected_ym,
                 workers=filtered_workers,
@@ -564,8 +669,9 @@ with tab_grid:
                 versions=versions,
                 custom_allowances=custom_allowances,
                 hide_allowances=hide_allowances,
-                default_edit_dim=edit_dim
+                default_edit_dim=st.session_state.get("dialog_edit_dim", edit_dim)
             )
+
         # 3. 데이터 그리드 빌드 (전체 대상)
         grid_data = []
         for w in filtered_workers:
@@ -627,6 +733,17 @@ with tab_grid:
                         row[day_col] = normal_val + over_val + prev_missing_val - deduction_val + weekly_val + monthly_val + lodging_val + health_val + leader_val + custom_val
                     else:
                         row[day_col] = normal_val + over_val + prev_missing_val - deduction_val + weekly_val + monthly_val
+                elif edit_dim == "적용 수당 요약":
+                    allowance_tags = []
+                    if weekly_val > 0: allowance_tags.append("주차")
+                    if monthly_val > 0: allowance_tags.append("월차")
+                    if lodging_val > 0: allowance_tags.append("숙소")
+                    if health_val > 0: allowance_tags.append("보건")
+                    if leader_val > 0: allowance_tags.append("팀장")
+                    for cat in custom_allowances:
+                        c_val = float(versions.get(key, {}).get("custom_" + cat["type_id"], 0.0) or 0.0)
+                        if c_val > 0: allowance_tags.append(cat["display_name"])
+                    row[day_col] = ", ".join(allowance_tags) if allowance_tags else ""
                 else:
                     if key in versions:
                         val = versions[key].get(dim_key)
@@ -657,6 +774,7 @@ with tab_grid:
             total_row = {
                 "주민번호": "일일 합계",
                 "성명": "",
+                "상태": "",
                 "소속팀": "",
                 "직종": ""
             }
@@ -700,8 +818,12 @@ with tab_grid:
                     style_df[day_col] = 'color: #C00000; font-weight: bold;'
                 elif weekday == 5:
                     style_df[day_col] = 'color: #1F497D; font-weight: bold;'
-            # 일일 합계 행은 전체 볼드 및 다크 버전 배경색 처리
+            # 퇴사자 행 붉은빛 전면 배경 강조 및 일일 합계 행 다크 배경 처리
             for idx in df.index:
+                st_val = str(df.loc[idx, "상태"]) if "상태" in df.columns else ""
+                if "퇴사" in st_val:
+                    for col in df.columns:
+                        style_df.loc[idx, col] = 'color: #FFD1D1; font-weight: bold; background-color: #5C1D1D;'
                 if df.loc[idx, "주민번호"] == "일일 합계":
                     for col in df.columns:
                         existing_style = style_df.loc[idx, col]
@@ -717,29 +839,183 @@ with tab_grid:
         col_config = {
             "주민번호": st.column_config.TextColumn("주민번호", pinned=True),
             "성명": st.column_config.TextColumn("성명", pinned=True),
+            "상태": st.column_config.TextColumn("재직상태", pinned=True),
             "소속팀": st.column_config.TextColumn("소속팀", pinned=True),
             "직종": st.column_config.TextColumn("직종", pinned=True),
         }
         # 일자별 컬럼 소수점 2자리 지정
         for day_col in styled_days:
-            col_config[day_col] = st.column_config.NumberColumn(day_col, format="%.2f")
+            if edit_dim in ["출역구분", "적용 수당 요약"]:
+                col_config[day_col] = st.column_config.TextColumn(day_col)
+            else:
+                col_config[day_col] = st.column_config.NumberColumn(day_col, format="%.2f")
         # 우측 합산 요약 컬럼 소수점 2자리 지정
         summary_num_cols = ["출역", "연장", "누락", "차감", "주차", "월차", "숙소", "보건", "팀장", "기타", "총공수"]
         for col in summary_num_cols:
             col_config[col] = st.column_config.NumberColumn(col, format="%.2f")
         # 메인 그리드는 모든 열 비활성화 (조회 전용)
         disabled_cols = list(df_grid.columns)
-        edited_df = st.data_editor(
+        st.dataframe(
             styled_df,
-            disabled=disabled_cols,
             column_config=col_config,
-            key=editor_key,
             use_container_width=True,
             hide_index=True
         )
         st.markdown("---")
-        # 5. 월말 집계 피벗 데이터 선계산
+        # 4-2. 특정 날짜 데이터 일괄 삭제 (초기화) 영역
+        with st.expander("🗑️ 특정 날짜 출역/공수 및 특정 수당 선택 삭제 (초기화)", expanded=False):
+            st.write("잘못 입력되거나 업로드된 **특정 날짜(하루)의 전체 데이터** 또는 **특정 수당/공수 항목만 골라서 삭제(0으로 초기화)**할 수 있습니다.")
+            del_date_opt_map = {}
+            for d_idx, d_str in enumerate(dates):
+                day_label = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:8]} ({styled_days[d_idx]})"
+                cnt_on_day = sum(1 for w in workers if f"{d_str}_{w['worker_id']}" in versions)
+                label_with_cnt = f"{day_label} — [입력 데이터: {cnt_on_day}명]" if cnt_on_day > 0 else f"{day_label} — [데이터 없음]"
+                del_date_opt_map[label_with_cnt] = d_str
+
+            col_dd1, col_dd2 = st.columns([1.5, 1])
+            with col_dd1:
+                sel_del_date_label = st.selectbox(
+                    "📅 삭제할 날짜 선택",
+                    options=list(del_date_opt_map.keys()),
+                    key=f"tab1_del_date_select_{st.session_state.selected_ym}"
+                )
+                target_del_date_str = del_date_opt_map[sel_del_date_label]
+            with col_dd2:
+                all_teams_for_del = sorted(list(set([w["team"] for w in workers if w.get("team")])))
+                sel_del_date_team = st.selectbox(
+                    "🎯 삭제 대상 팀 선택 (전체는 모든 근로자)",
+                    options=["전체"] + all_teams_for_del,
+                    key=f"tab1_del_date_team_{st.session_state.selected_ym}"
+                )
+
+            date_summary = db_manager.get_date_attendance_summary(target_del_date_str, team=sel_del_date_team)
+            att_cnt = date_summary["attendance_count"]
+            cust_cnt = date_summary["custom_count"]
+            fmt_target_date = f"{target_del_date_str[:4]}-{target_del_date_str[4:6]}-{target_del_date_str[6:8]}"
+
+            if att_cnt == 0 and cust_cnt == 0:
+                st.info(f"💡 선택한 날짜(**{fmt_target_date}**, 대상: **{sel_del_date_team}**)에는 저장된 출역/공수 데이터가 없습니다.")
+            else:
+                del_mode_t1 = st.radio(
+                    "🛠️ 삭제 방식 선택",
+                    [
+                        "1. 전체 삭제 (해당 날짜의 출역·공수·모든 수당 전체 초기화)",
+                        "2. 특정 수당/공수 항목만 선택하여 삭제 (선택한 수당만 0으로 초기화)"
+                    ],
+                    horizontal=True,
+                    key=f"tab1_del_mode_{target_del_date_str}_{sel_del_date_team}"
+                )
+                is_selective_t1 = del_mode_t1.startswith("2.")
+
+                # 항목별 현재 입력된 건수 집계
+                recs_t1 = date_summary["records"]
+                field_defs_t1 = [
+                    ("lodging_weight", "숙소수당"),
+                    ("health_weight", "보건수당"),
+                    ("leader_weight", "팀장수당"),
+                    ("weekly_holiday", "주차수당"),
+                    ("monthly_holiday", "월차수당"),
+                ]
+                for ct in date_summary.get("custom_types", []):
+                    field_defs_t1.append((f"custom_{ct['type_id']}", f"[추가수당] {ct['display_name']}수당"))
+                field_defs_t1.extend([
+                    ("normal_weight", "일반공수"),
+                    ("overtime_weight", "연장공수"),
+                    ("prev_month_missing", "전월 누락공수"),
+                    ("deduction", "차감공수"),
+                ])
+
+                field_label_map_t1 = {}
+                for f_key, f_name in field_defs_t1:
+                    f_cnt = sum(1 for r in recs_t1 if float(r.get(f_key, 0.0) or 0.0) != 0.0)
+                    lbl = f"{f_name} (현재 {f_cnt}명 입력됨)" if f_cnt > 0 else f"{f_name} (0명)"
+                    field_label_map_t1[lbl] = (f_key, f_name)
+
+                selected_target_fields_t1 = None
+                selected_field_names_t1 = []
+                if is_selective_t1:
+                    default_lbls_t1 = [lbl for lbl, (fk, _) in field_label_map_t1.items() if "현재 " in lbl and fk not in ("normal_weight", "overtime_weight")]
+                    sel_lbls_t1 = st.multiselect(
+                        "🧹 삭제(0으로 초기화)할 수당/공수 항목을 선택하세요 (여러 개 선택 가능)",
+                        options=list(field_label_map_t1.keys()),
+                        default=default_lbls_t1,
+                        key=f"tab1_sel_fields_{target_del_date_str}_{sel_del_date_team}"
+                    )
+                    selected_target_fields_t1 = [field_label_map_t1[l][0] for l in sel_lbls_t1]
+                    selected_field_names_t1 = [field_label_map_t1[l][1] for l in sel_lbls_t1]
+
+                st.warning(
+                    f"⚠️ **{fmt_target_date}** (대상: **{sel_del_date_team}**)에 저장된 출역 데이터 **{att_cnt}건**"
+                    + (f", 추가수당 **{cust_cnt}건**" if cust_cnt > 0 else "")
+                    + (" 중 선택하신 **[" + ", ".join(selected_field_names_t1) + "]** 항목만 0으로 삭제됩니다." if is_selective_t1 and selected_field_names_t1 else "이 존재합니다.")
+                )
+                if date_summary["records"]:
+                    rename_map_t1 = {
+                        "worker_id": "주민번호",
+                        "name": "성명",
+                        "team": "소속팀",
+                        "normal_weight": "일반공수",
+                        "overtime_weight": "연장공수",
+                        "prev_month_missing": "누락",
+                        "deduction": "차감",
+                        "weekly_holiday": "주차",
+                        "monthly_holiday": "월차",
+                        "lodging_weight": "숙소",
+                        "health_weight": "보건",
+                        "leader_weight": "팀장"
+                    }
+                    for ct in date_summary.get("custom_types", []):
+                        rename_map_t1[f"custom_{ct['type_id']}"] = f"{ct['display_name']}수당"
+                    df_del_preview = pd.DataFrame(date_summary["records"]).rename(columns=rename_map_t1)
+                    st.dataframe(df_del_preview, use_container_width=True, hide_index=True)
+
+                can_proceed_t1 = (not is_selective_t1) or (len(selected_target_fields_t1) > 0)
+                action_desc_t1 = (
+                    f"선택한 수당/공수({', '.join(selected_field_names_t1)})"
+                    if is_selective_t1 else "모든 출역/공수/수당 데이터"
+                )
+                confirm_date_del = st.checkbox(
+                    f"위 내용을 확인하였으며, {fmt_target_date} ({sel_del_date_team})의 {action_desc_t1}를 삭제합니다.",
+                    disabled=not can_proceed_t1,
+                    key=f"tab1_confirm_del_date_{target_del_date_str}_{sel_del_date_team}_{is_selective_t1}"
+                )
+                if st.button(
+                    f"🗑️ {fmt_target_date} ({sel_del_date_team}) {action_desc_t1} 삭제 실행",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(is_locked or not confirm_date_del or not can_proceed_t1),
+                    key=f"tab1_btn_del_date_{target_del_date_str}_{sel_del_date_team}_{is_selective_t1}"
+                ):
+                    try:
+                        del_res = db_manager.delete_attendance_by_date(
+                            target_del_date_str,
+                            st.session_state.user_id,
+                            team=sel_del_date_team,
+                            target_fields=selected_target_fields_t1 if is_selective_t1 else None
+                        )
+                        st.toast(f"✅ {fmt_target_date} ({action_desc_t1}) 삭제가 완료되었습니다!")
+                        get_attendance_grid.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"날짜 데이터 삭제 중 오류 발생: {e}")
+
+        st.markdown("---")
+        # 5. 월말 집계 피벗 데이터 선계산 옵션 선택
+        st.markdown("##### ⚙️ 월말 집계표 다운로드 및 미리보기 옵션")
+        export_mode = st.radio(
+            "📅 일자별 칸(1일~31일) 공수 표시 방식",
+            [
+                "1. 일자별 총공수 표시 (일반+연장+누락-차감+수당 모두 합산)",
+                "2. 일자별 일반/연장 공수만 표시 (그 외 주월차/수당은 우측 집계란에만 합산)"
+            ],
+            index=0,
+            horizontal=True,
+            key="excel_export_mode_radio"
+        )
+        show_only_normal_overtime = "2." in export_mode
+        
         pivot_rows = []
+        custom_rows = []
         all_w_list, all_a_list, all_dates, all_days, all_versions, all_custom_allowances = get_attendance_grid(st.session_state.selected_ym)
         for w in all_w_list:
             tot_normal = 0.0
@@ -752,9 +1028,22 @@ with tab_grid:
             tot_health = 0.0
             tot_leader = 0.0
             tot_custom = 0.0
+            custom_sums_for_w = {cat["type_id"]: 0.0 for cat in all_custom_allowances}
+
+            r_date_raw = w.get("resignation_date")
+            if r_date_raw:
+                r_clean = str(r_date_raw).replace("-", "").replace("/", "").strip()
+                if len(r_clean) >= 8:
+                    status_disp = f"🔴 퇴사 ({r_clean[4:6]}/{r_clean[6:8]})"
+                else:
+                    status_disp = f"🔴 퇴사 ({r_date_raw})"
+            else:
+                status_disp = "재직"
+
             row_sum = {
                 "주민번호": w["worker_id"],
                 "성명": w["name"],
+                "상태": status_disp,
                 "팀": w["team"] or "",
                 "직종": w["trade"] or ""
             }
@@ -783,13 +1072,9 @@ with tab_grid:
                     health_val = rec.get("health_weight", 0.0) or 0.0
                     leader_val = rec.get("leader_weight", 0.0) or 0.0
                     for cat in all_custom_allowances:
-                        custom_val += float(rec.get("custom_" + cat["type_id"], 0.0))
-                # 셀 표시는 숨김 설정 체크 여부에 따라 총공수 연산 적용
-                if not hide_allowances:
-                    row_sum[day_col] = normal_val + over_val + prev_missing_val - deduction_val + weekly_val + monthly_val + lodging_val + health_val + leader_val + custom_val
-                else:
-                    row_sum[day_col] = normal_val + over_val + prev_missing_val - deduction_val + weekly_val + monthly_val
-                tot_custom += custom_val
+                        c_val = float(rec.get("custom_" + cat["type_id"], 0.0) or 0.0)
+                        custom_val += c_val
+                        custom_sums_for_w[cat["type_id"]] += c_val
                 tot_normal += normal_val
                 tot_overtime += over_val
                 tot_prev_missing += prev_missing_val
@@ -799,7 +1084,13 @@ with tab_grid:
                 tot_lodging += lodging_val
                 tot_health += health_val
                 tot_leader += leader_val
-            # 합산 열 기입
+                tot_custom += custom_val
+                
+                if show_only_normal_overtime:
+                    val_sum = normal_val + over_val
+                else:
+                    val_sum = normal_val + over_val + prev_missing_val - deduction_val + weekly_val + monthly_val + lodging_val + health_val + leader_val + custom_val
+                row_sum[day_col] = val_sum
             row_sum["출역"] = tot_normal
             row_sum["연장"] = tot_overtime
             row_sum["누락"] = tot_prev_missing
@@ -810,60 +1101,98 @@ with tab_grid:
                 row_sum["숙소"] = tot_lodging
                 row_sum["보건"] = tot_health
                 row_sum["팀장"] = tot_leader
+                for cat in all_custom_allowances:
+                    row_sum[f"{cat['display_name']}수당"] = custom_sums_for_w[cat["type_id"]]
                 row_sum["기타"] = tot_custom
                 row_sum["총공수"] = tot_normal + tot_overtime + tot_prev_missing - tot_deduction + tot_weekly + tot_monthly + tot_lodging + tot_health + tot_leader + tot_custom
             else:
                 row_sum["총공수"] = tot_normal + tot_overtime + tot_prev_missing - tot_deduction + tot_weekly + tot_monthly
             pivot_rows.append(row_sum)
-        # df_pivot_out에 합계 행 추가 및 반올림
+
+            if all_custom_allowances:
+                c_row = {
+                    "주민번호": w["worker_id"],
+                    "성명": w["name"],
+                    "상태": status_disp,
+                    "팀": w["team"] or "",
+                    "직종": w["trade"] or ""
+                }
+                tot_c_sum = 0.0
+                for cat in all_custom_allowances:
+                    c_amt = custom_sums_for_w[cat["type_id"]]
+                    c_row[f"{cat['display_name']}수당"] = c_amt
+                    tot_c_sum += c_amt
+                c_row["추가수당 합계"] = tot_c_sum
+                custom_rows.append(c_row)
+            
         if pivot_rows:
-            p_total = {
+            total_sum_row = {
                 "주민번호": "일일 합계",
                 "성명": "",
+                "상태": "",
                 "팀": "",
                 "직종": ""
             }
-            p_total["출역"] = round(sum(r["출역"] for r in pivot_rows), 2)
-            p_total["연장"] = round(sum(r["연장"] for r in pivot_rows), 2)
-            p_total["누락"] = round(sum(r["누락"] for r in pivot_rows), 2)
-            p_total["차감"] = round(sum(r["차감"] for r in pivot_rows), 2)
-            p_total["주차"] = round(sum(r["주차"] for r in pivot_rows), 2)
-            p_total["월차"] = round(sum(r["월차"] for r in pivot_rows), 2)
+            for d_idx, d_str in enumerate(all_dates):
+                day_col = all_days[d_idx]
+                total_sum_row[day_col] = round(sum(float(r[day_col]) for r in pivot_rows if day_col in r), 2)
+            total_sum_row["출역"] = round(sum(float(r["출역"]) for r in pivot_rows if "출역" in r), 2)
+            total_sum_row["연장"] = round(sum(float(r["연장"]) for r in pivot_rows if "연장" in r), 2)
+            total_sum_row["누락"] = round(sum(float(r["누락"]) for r in pivot_rows if "누락" in r), 2)
+            total_sum_row["차감"] = round(sum(float(r["차감"]) for r in pivot_rows if "차감" in r), 2)
+            total_sum_row["주차"] = round(sum(float(r["주차"]) for r in pivot_rows if "주차" in r), 2)
+            total_sum_row["월차"] = round(sum(float(r["월차"]) for r in pivot_rows if "월차" in r), 2)
             if not hide_allowances:
-                p_total["숙소"] = round(sum(r["숙소"] for r in pivot_rows), 2)
-                p_total["보건"] = round(sum(r["보건"] for r in pivot_rows), 2)
-                p_total["팀장"] = round(sum(r["팀장"] for r in pivot_rows), 2)
-                p_total["기타"] = round(sum(r["기타"] for r in pivot_rows), 2)
-            p_total["총공수"] = round(sum(r["총공수"] for r in pivot_rows), 2)
-            # 일자별 컬럼이 있으면 일자별 합계도 채움
-            for day_col in all_days:
-                if day_col in pivot_rows[0]:
-                    p_total[day_col] = round(sum(r[day_col] for r in pivot_rows), 2)
+                total_sum_row["숙소"] = round(sum(float(r["숙소"]) for r in pivot_rows if "숙소" in r), 2)
+                total_sum_row["보건"] = round(sum(float(r["보건"]) for r in pivot_rows if "보건" in r), 2)
+                total_sum_row["팀장"] = round(sum(float(r["팀장"]) for r in pivot_rows if "팀장" in r), 2)
+                for cat in all_custom_allowances:
+                    c_col = f"{cat['display_name']}수당"
+                    total_sum_row[c_col] = round(sum(float(r[c_col]) for r in pivot_rows if c_col in r), 2)
+                total_sum_row["기타"] = round(sum(float(r["기타"]) for r in pivot_rows if "기타" in r), 2)
+            total_sum_row["총공수"] = round(sum(float(r["총공수"]) for r in pivot_rows if "총공수" in r), 2)
             import copy
-            pivot_rows_with_total = copy.deepcopy(pivot_rows)
-            pivot_rows_with_total.insert(0, copy.deepcopy(p_total))
-            pivot_rows_with_total.append(copy.deepcopy(p_total))
-            df_pivot_out = pd.DataFrame(pivot_rows_with_total)
-        else:
-            df_pivot_out = pd.DataFrame(pivot_rows)
-        # 6. 재계산 / 다운로드 버튼 레이아웃
-        col_btn1, col_btn2 = st.columns([1, 2])
-        # 6-1. 주월차/보건 적용
+            pivot_rows.insert(0, copy.deepcopy(total_sum_row))
+            pivot_rows.append(copy.deepcopy(total_sum_row))
+            
+        df_pivot_out = pd.DataFrame(pivot_rows)
+
+        df_custom_out = pd.DataFrame()
+        if custom_rows:
+            total_c_row = {
+                "주민번호": "일일 합계",
+                "성명": "",
+                "상태": "",
+                "팀": "",
+                "직종": ""
+            }
+            for cat in all_custom_allowances:
+                c_col = f"{cat['display_name']}수당"
+                total_c_row[c_col] = round(sum(float(r[c_col]) for r in custom_rows if c_col in r), 2)
+            total_c_row["추가수당 합계"] = round(sum(float(r["추가수당 합계"]) for r in custom_rows if "추가수당 합계" in r), 2)
+            import copy
+            custom_rows.insert(0, copy.deepcopy(total_c_row))
+            custom_rows.append(copy.deepcopy(total_c_row))
+            df_custom_out = pd.DataFrame(custom_rows)
+
+        # 6. 자동 수당 연산 버튼 영역
+        st.markdown("---")
+        st.markdown("##### ⚡ 주휴/월차/보건수당 자동 연산 시스템")
+        col_btn1, col_btn2 = st.columns([1, 1])
         with col_btn1:
-            calc_submit = st.button("🔄 주월차/보건 적용", disabled=is_locked, use_container_width=True)
-            if calc_submit:
-                with st.spinner("해당 월의 주휴(주차)/월차 및 보건 수당을 산출하여 적용하고 있습니다..."):
+            if st.button("🔄 주차/월차/보건 수당 자동 재계산 및 반영", type="primary", use_container_width=True, disabled=is_locked):
+                with st.spinner("주차/월차/보건 수당 규칙을 기반으로 전체 연산을 수행 중입니다..."):
                     try:
                         calc_engine.recalculate_month(st.session_state.selected_ym, st.session_state.user_id)
-                        st.success("주월차 및 보건 수당 적용이 성공적으로 완료되었습니다!")
+                        st.success("성공적으로 주차, 월차, 보건 수당을 자동 연산하여 반영했습니다!")
                         get_attendance_grid.clear()
                         st.rerun()
                     except Exception as e:
                         st.error(f"주월차/보건 적용 중 오류 발생: {e}")
-        # 6-2. 엑셀 리포트 출력 다운로드
+        # 6-2. 엑셀 리포트 출력 다운로드 (메인 시트 + 추가수당 시트 세트 생성)
         with col_btn2:
             if not df_pivot_out.empty:
-                excel_bytes = excel_io.export_monthly_excel(df_pivot_out, st.session_state.selected_ym)
+                excel_bytes = excel_io.export_monthly_excel(df_pivot_out, st.session_state.selected_ym, df_custom=df_custom_out)
                 st.download_button(
                      label="📤 월말 공수 집계표 다운로드 (Excel)",
                      data=excel_bytes,
@@ -871,21 +1200,111 @@ with tab_grid:
                      mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                      use_container_width=True
                 )
-        # 7. 월말 집계 요약 미리보기 테이블 표시
-        st.markdown("##### 📊 월말 집계 요약 미리보기")
-        summary_cols = ["주민번호", "성명", "팀", "직종", "출역", "연장", "주차", "월차"]
+        # 7. 월말 집계 요약 미리보기 테이블 표시 (메인 집계표 & 추가 수당 집계표)
+        st.markdown("##### 📊 월말 집계 요약 미리보기 (전체)")
+        summary_cols = ["주민번호", "성명", "상태", "팀", "직종", "출역", "연장", "주차", "월차"]
         if not hide_allowances:
-             summary_cols += ["숙소", "보건", "팀장", "기타"]
+             summary_cols += ["숙소", "보건", "팀장"]
+             for cat in all_custom_allowances:
+                 c_col = f"{cat['display_name']}수당"
+                 if c_col not in summary_cols:
+                     summary_cols.append(c_col)
+             summary_cols += ["기타"]
         summary_cols += ["총공수"]
+
+        # 추가 수당 요약 컬럼 소수점 2자리 지정 추가
+        for cat in all_custom_allowances:
+            c_col = f"{cat['display_name']}수당"
+            col_config[c_col] = st.column_config.NumberColumn(c_col, format="%.2f")
+        col_config["추가수당 합계"] = st.column_config.NumberColumn("추가수당 합계", format="%.2f")
+
         def style_summary(df):
             style_df = pd.DataFrame('', index=df.index, columns=df.columns)
             for idx in df.index:
+                st_val = str(df.loc[idx, "상태"]) if "상태" in df.columns else ""
+                if "퇴사" in st_val:
+                    for col in df.columns:
+                        style_df.loc[idx, col] = 'color: #FFD1D1; font-weight: bold; background-color: #5C1D1D;'
                 if df.loc[idx, "주민번호"] == "일일 합계":
                     for col in df.columns:
                         style_df.loc[idx, col] = 'color: #F8FAFC; font-weight: bold; background-color: #1E293B; font-size: 13px;'
             return style_df
-        styled_summary_df = df_pivot_out[summary_cols].style.apply(style_summary, axis=None)
+        valid_summary_cols = [c for c in summary_cols if c in df_pivot_out.columns]
+        styled_summary_df = df_pivot_out[valid_summary_cols].style.apply(style_summary, axis=None)
         st.dataframe(styled_summary_df, column_config=col_config, use_container_width=True, hide_index=True)
+
+        if not df_custom_out.empty and all_custom_allowances:
+            st.markdown("##### 💰 추가 수당 상세 집계표 (개별 수당별 집계)")
+            styled_custom_summary_df = df_custom_out.style.apply(style_summary, axis=None)
+            st.dataframe(styled_custom_summary_df, column_config=col_config, use_container_width=True, hide_index=True)
+
+        if long_resigned_workers:
+            with st.expander(f"📁 해당 월 1일 기준 1달 이상 퇴사자 전용 목록 (공수입력 제외 대상: {len(long_resigned_workers)}명)", expanded=False):
+                st.info("💡 아래 근로자들은 해당 월 1일 자 기준으로 퇴사한 지 1달 이상 경과하여 메인 공수 표 및 편집창에서 자동 제외되었습니다.")
+                df_long_list = pd.DataFrame(long_resigned_workers)
+                df_long_list_renamed = df_long_list.rename(columns={
+                    "worker_id": "주민번호",
+                    "name": "성명",
+                    "team": "소속팀",
+                    "trade": "직종/공종",
+                    "hire_date": "입사일",
+                    "resignation_date": "퇴사일",
+                    "remarks": "비고"
+                })
+                col_show_long = ["주민번호", "성명", "소속팀", "직종/공종", "입사일", "퇴사일", "비고"]
+                df_long_list_renamed = df_long_list_renamed[[c for c in col_show_long if c in df_long_list_renamed.columns]]
+                st.dataframe(df_long_list_renamed, use_container_width=True, hide_index=True)
+
+        # 8. 일자별 수당 적용 현황 요약표 (날짜별 적용 수당 및 지급 인원)
+        st.markdown("---")
+        st.markdown("##### 📅 일자별 수당 적용 현황 요약 (날짜별 적용 수당 종류 및 지급 인원)")
+        daily_summary_list = []
+        for d_idx, d_str in enumerate(all_dates):
+            day_col = all_days[d_idx]
+            cnt_w = 0
+            cnt_m = 0
+            cnt_l = 0
+            cnt_h = 0
+            cnt_le = 0
+            c_cnts = {cat["type_id"]: 0 for cat in all_custom_allowances}
+            for w in all_w_list:
+                k = f"{d_str}_{w['worker_id']}"
+                if k in all_versions:
+                    r = all_versions[k]
+                    if (r.get("weekly_holiday", 0.0) or 0.0) > 0: cnt_w += 1
+                    if (r.get("monthly_holiday", 0.0) or 0.0) > 0: cnt_m += 1
+                    if (r.get("lodging_weight", 0.0) or 0.0) > 0: cnt_l += 1
+                    if (r.get("health_weight", 0.0) or 0.0) > 0: cnt_h += 1
+                    if (r.get("leader_weight", 0.0) or 0.0) > 0: cnt_le += 1
+                    for cat in all_custom_allowances:
+                        if float(r.get("custom_" + cat["type_id"], 0.0) or 0.0) > 0:
+                            c_cnts[cat["type_id"]] += 1
+            act_tags = []
+            if cnt_w > 0: act_tags.append(f"주차({cnt_w}명)")
+            if cnt_m > 0: act_tags.append(f"월차({cnt_m}명)")
+            if cnt_l > 0: act_tags.append(f"숙소({cnt_l}명)")
+            if cnt_h > 0: act_tags.append(f"보건({cnt_h}명)")
+            if cnt_le > 0: act_tags.append(f"팀장({cnt_le}명)")
+            for cat in all_custom_allowances:
+                c_num = c_cnts[cat["type_id"]]
+                if c_num > 0:
+                    act_tags.append(f"{cat['display_name']}({c_num}명)")
+            d_row = {
+                "날짜": styled_days[d_idx],
+                "주차수당": f"{cnt_w}명" if cnt_w > 0 else "-",
+                "월차수당": f"{cnt_m}명" if cnt_m > 0 else "-",
+                "숙소수당": f"{cnt_l}명" if cnt_l > 0 else "-",
+                "보건수당": f"{cnt_h}명" if cnt_h > 0 else "-",
+                "팀장수당": f"{cnt_le}명" if cnt_le > 0 else "-",
+            }
+            for cat in all_custom_allowances:
+                c_num = c_cnts[cat["type_id"]]
+                d_row[f"{cat['display_name']}수당"] = f"{c_num}명" if c_num > 0 else "-"
+            d_row["적용 수당 요약"] = ", ".join(act_tags) if act_tags else "-"
+            daily_summary_list.append(d_row)
+        df_daily_summary_out = pd.DataFrame(daily_summary_list)
+        st.dataframe(df_daily_summary_out, use_container_width=True, hide_index=True)
+
 # ----------------- Tab 2: 일일 출역일보 업로드 -----------------
 with tab_upload:
     st.subheader("📥 출역 및 공수 데이터 업로드 센터")
@@ -917,11 +1336,12 @@ with tab_upload:
             st.session_state.persistent_import_warnings = None
             st.rerun()
     st.write("단말기 집계 일일출역보, 선택적 일괄 입력 서식, 혹은 원청사(현대건설) 일일출역 엑셀을 연동하여 공수를 빠르게 채웁니다.")
-    sub_tab_daily, sub_tab_bulk, sub_tab_hyundai, sub_tab_check = st.tabs([
+    sub_tab_daily, sub_tab_bulk, sub_tab_hyundai, sub_tab_check, sub_tab_del_date = st.tabs([
         "일일출역보 엑셀 업로드 (기본)",
         "선택적 공수 일괄 등록 (덮어쓰기)",
         "현대건설 샤힌현장 일일출역 연동",
-        "✅ 일별 입력 체크리스트"
+        "✅ 일별 입력 체크리스트",
+        "🗑️ 특정 날짜 데이터 삭제"
     ])
     with sub_tab_daily:
         col_u1, col_u2 = st.columns([1, 1])
@@ -1128,10 +1548,141 @@ with tab_upload:
                     new_checks[d_key] = bool(row["완료여부"])
                 db_manager.save_daily_checks(new_checks)
                 st.success("✅ 일별 완료 체크 정보가 성공적으로 저장되었습니다.")
+    with sub_tab_del_date:
+        st.markdown("#### 🗑️ 특정 날짜 출역/공수 및 특정 수당 선택 삭제")
+        st.write("날짜를 잘못 선택하여 업로드했거나 특정 일자의 **전체 데이터** 또는 **특정 수당(숙소·보건·팀장·주월차·추가수당 등)만 골라서 삭제(0으로 초기화)**할 수 있습니다.")
+        col_del_d1, col_del_d2 = st.columns([1, 1])
+        with col_del_d1:
+            del_picker_date = st.date_input("📅 데이터를 삭제할 날짜 선택", datetime.date.today(), key="tab2_del_date_picker")
+            del_picker_str = del_picker_date.strftime("%Y%m%d")
+            del_picker_fmt = del_picker_date.strftime("%Y-%m-%d")
+        with col_del_d2:
+            all_w_for_del = db_manager.get_all_workers()
+            teams_for_del_tab2 = sorted(list(set([w["team"] for w in all_w_for_del if w.get("team")])))
+            sel_team_tab2 = st.selectbox(
+                "🎯 삭제 대상 팀 선택 (전체 선택 시 해당 날짜의 모든 근로자 데이터 삭제)",
+                options=["전체"] + teams_for_del_tab2,
+                key="tab2_del_date_team"
+            )
+
+        t2_summary = db_manager.get_date_attendance_summary(del_picker_str, team=sel_team_tab2)
+        t2_att_cnt = t2_summary["attendance_count"]
+        t2_cust_cnt = t2_summary["custom_count"]
+
+        if t2_att_cnt == 0 and t2_cust_cnt == 0:
+            st.info(f"💡 선택한 날짜(**{del_picker_fmt}**, 대상: **{sel_team_tab2}**)에 저장된 출역/공수 데이터가 없습니다.")
+        else:
+            del_mode_t2 = st.radio(
+                "🛠️ 삭제 방식 선택",
+                [
+                    "1. 전체 삭제 (해당 날짜의 출역·공수·모든 수당 전체 초기화)",
+                    "2. 특정 수당/공수 항목만 선택하여 삭제 (선택한 수당만 0으로 초기화)"
+                ],
+                horizontal=True,
+                key=f"tab2_del_mode_{del_picker_str}_{sel_team_tab2}"
+            )
+            is_selective_t2 = del_mode_t2.startswith("2.")
+
+            recs_t2 = t2_summary["records"]
+            field_defs_t2 = [
+                ("lodging_weight", "숙소수당"),
+                ("health_weight", "보건수당"),
+                ("leader_weight", "팀장수당"),
+                ("weekly_holiday", "주차수당"),
+                ("monthly_holiday", "월차수당"),
+            ]
+            for ct in t2_summary.get("custom_types", []):
+                field_defs_t2.append((f"custom_{ct['type_id']}", f"[추가수당] {ct['display_name']}수당"))
+            field_defs_t2.extend([
+                ("normal_weight", "일반공수"),
+                ("overtime_weight", "연장공수"),
+                ("prev_month_missing", "전월 누락공수"),
+                ("deduction", "차감공수"),
+            ])
+
+            field_label_map_t2 = {}
+            for f_key, f_name in field_defs_t2:
+                f_cnt = sum(1 for r in recs_t2 if float(r.get(f_key, 0.0) or 0.0) != 0.0)
+                lbl = f"{f_name} (현재 {f_cnt}명 입력됨)" if f_cnt > 0 else f"{f_name} (0명)"
+                field_label_map_t2[lbl] = (f_key, f_name)
+
+            selected_target_fields_t2 = None
+            selected_field_names_t2 = []
+            if is_selective_t2:
+                default_lbls_t2 = [lbl for lbl, (fk, _) in field_label_map_t2.items() if "현재 " in lbl and fk not in ("normal_weight", "overtime_weight")]
+                sel_lbls_t2 = st.multiselect(
+                    "🧹 삭제(0으로 초기화)할 수당/공수 항목을 선택하세요 (여러 개 선택 가능)",
+                    options=list(field_label_map_t2.keys()),
+                    default=default_lbls_t2,
+                    key=f"tab2_sel_fields_{del_picker_str}_{sel_team_tab2}"
+                )
+                selected_target_fields_t2 = [field_label_map_t2[l][0] for l in sel_lbls_t2]
+                selected_field_names_t2 = [field_label_map_t2[l][1] for l in sel_lbls_t2]
+
+            st.warning(
+                f"⚠️ **{del_picker_fmt}** (대상: **{sel_team_tab2}**)에 저장된 출역 기록 **{t2_att_cnt}건**"
+                + (f", 추가수당 **{t2_cust_cnt}건**" if t2_cust_cnt > 0 else "")
+                + (" 중 선택하신 **[" + ", ".join(selected_field_names_t2) + "]** 항목만 0으로 삭제됩니다." if is_selective_t2 and selected_field_names_t2 else "이 조회되었습니다.")
+            )
+            if t2_summary["records"]:
+                rename_map_t2 = {
+                    "worker_id": "주민번호",
+                    "name": "성명",
+                    "team": "소속팀",
+                    "normal_weight": "일반공수",
+                    "overtime_weight": "연장공수",
+                    "prev_month_missing": "누락",
+                    "deduction": "차감",
+                    "weekly_holiday": "주차",
+                    "monthly_holiday": "월차",
+                    "lodging_weight": "숙소",
+                    "health_weight": "보건",
+                    "leader_weight": "팀장"
+                }
+                for ct in t2_summary.get("custom_types", []):
+                    rename_map_t2[f"custom_{ct['type_id']}"] = f"{ct['display_name']}수당"
+                df_t2_preview = pd.DataFrame(t2_summary["records"]).rename(columns=rename_map_t2)
+                st.dataframe(df_t2_preview, use_container_width=True, hide_index=True)
+
+            can_proceed_t2 = (not is_selective_t2) or (len(selected_target_fields_t2) > 0)
+            action_desc_t2 = (
+                f"선택한 수당/공수({', '.join(selected_field_names_t2)})"
+                if is_selective_t2 else "모든 출역/공수/수당 데이터"
+            )
+            t2_confirm = st.checkbox(
+                f"위 내역을 확인하였으며, {del_picker_fmt} ({sel_team_tab2})의 {action_desc_t2}를 삭제합니다.",
+                disabled=not can_proceed_t2,
+                key=f"tab2_confirm_del_{del_picker_str}_{sel_team_tab2}_{is_selective_t2}"
+            )
+            if st.button(
+                f"🗑️ {del_picker_fmt} ({sel_team_tab2}) {action_desc_t2} 삭제 실행",
+                type="primary",
+                use_container_width=True,
+                disabled=(not t2_confirm or not can_proceed_t2),
+                key=f"tab2_btn_del_{del_picker_str}_{sel_team_tab2}_{is_selective_t2}"
+            ):
+                try:
+                    del_res2 = db_manager.delete_attendance_by_date(
+                        del_picker_str,
+                        st.session_state.user_id,
+                        team=sel_team_tab2,
+                        target_fields=selected_target_fields_t2 if is_selective_t2 else None
+                    )
+                    st.session_state.persistent_import_success = (
+                        f"✅ {del_picker_fmt} ({sel_team_tab2}) [{action_desc_t2}] 삭제 완료! "
+                        f"(반영된 출역 기록: {del_res2['deleted_attendance']}건, 추가수당: {del_res2['deleted_custom']}건)"
+                    )
+                    st.session_state.persistent_import_error = None
+                    st.session_state.persistent_import_warnings = None
+                    get_attendance_grid.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"삭제 중 오류 발생: {e}")
+
 # ----------------- Tab 3: 근로자 관리 및 일괄등록 -----------------
 with tab_workers:
     st.subheader("👤 근로자 관리 및 일괄등록")
-    tab_w_list, tab_w_bulk, tab_w_add = st.tabs(["근로자 목록 조회", "📥 근로자 일괄등록", "➕ 개별 근로자 신규추가"])
+    tab_w_list, tab_w_edit, tab_w_delete, tab_w_bulk, tab_w_add = st.tabs(["근로자 목록 조회", "✏️ 개별 근로자 상세 수정", "🗑️ 근로자 삭제", "📥 근로자 일괄등록", "➕ 개별 근로자 신규추가"])
     # 3-1. 근로자 목록 조회
     with tab_w_list:
         workers_list = db_manager.get_all_workers()
@@ -1143,6 +1694,7 @@ with tab_workers:
             df_workers["has_lodging"] = df_workers["has_lodging"] == 1
             df_workers["has_health"] = df_workers["has_health"] == 1
             df_workers["is_team_leader"] = df_workers["is_team_leader"] == 1
+            df_workers["exclude_holiday"] = df_workers["exclude_holiday"] == 1
             # 한글 이름으로 컬럼 매핑
             col_renames = {
                 "worker_id": "주민번호",
@@ -1151,11 +1703,12 @@ with tab_workers:
                 "trade": "직종/공종",
                 "hire_date": "입사일",
                 "resignation_date": "퇴사일",
+                "exclude_holiday": "주월차제외",
                 "remarks": "비고"
             }
             df_workers_renamed = df_workers.rename(columns=col_renames)
             # 컬럼 순서 및 구성 설정
-            col_order = ["주민번호", "성명", "소속팀", "직종/공종", "입사일", "퇴사일", "비고"]
+            col_order = ["주민번호", "성명", "소속팀", "직종/공종", "입사일", "퇴사일", "주월차제외", "비고"]
             df_workers_renamed = df_workers_renamed[col_order]
             col_config = {
                 "주민번호": st.column_config.TextColumn("주민번호", disabled=False),
@@ -1164,6 +1717,7 @@ with tab_workers:
                 "직종/공종": st.column_config.TextColumn("직종/공종"),
                 "입사일": st.column_config.TextColumn("입사일 (YYYY-MM-DD)"),
                 "퇴사일": st.column_config.TextColumn("퇴사일 (YYYY-MM-DD)"),
+                "주월차제외": st.column_config.CheckboxColumn("주월차제외", default=False),
                 "비고": st.column_config.TextColumn("비고")
             }
             # 근로자 목록 다운로드 기능 추가
@@ -1215,6 +1769,7 @@ with tab_workers:
                             has_lodging = db_row["has_lodging"]
                             has_health = db_row["has_health"]
                             is_team_leader = db_row["is_team_leader"]
+                            exclude_holiday = 1 if changes.get("주월차제외", db_row.get("exclude_holiday", 0) == 1) else 0
                             hire_date = changes.get("입사일", db_row["hire_date"])
                             resignation_date = changes.get("퇴사일", db_row["resignation_date"])
                             if resignation_date == "":
@@ -1246,9 +1801,9 @@ with tab_workers:
                             # 나머지 필드 업데이트
                             cursor.execute("""
                                 UPDATE workers
-                                SET name = ?, team = ?, trade = ?, has_lodging = ?, has_health = ?, is_team_leader = ?, hire_date = ?, resignation_date = ?, remarks = ?
+                                SET name = ?, team = ?, trade = ?, has_lodging = ?, has_health = ?, is_team_leader = ?, exclude_holiday = ?, hire_date = ?, resignation_date = ?, remarks = ?
                                 WHERE worker_id = ?;
-                            """, (name, team, trade, has_lodging, has_health, is_team_leader, hire_date, resignation_date, remarks, new_worker_id))
+                            """, (name, team, trade, has_lodging, has_health, is_team_leader, exclude_holiday, hire_date, resignation_date, remarks, new_worker_id))
                             # 감사 로그 남기기
                             db_manager.log_audit(
                                 user_id=st.session_state.user_id,
@@ -1259,7 +1814,12 @@ with tab_workers:
                                 conn=conn
                             )
                         conn.commit()
-                        st.success("근로자 정보 및 주민번호 변경사항이 성공적으로 저장되었습니다!")
+                        if "selected_ym" in st.session_state:
+                            try:
+                                calc_engine.recalculate_month(st.session_state.selected_ym, st.session_state.user_id)
+                            except Exception as re_err:
+                                pass
+                        st.success("근로자 정보 변경사항이 DB에 저장되었으며, 주월차 수당이 성공적으로 자동 재계산 및 반영되었습니다!")
                         get_attendance_grid.clear()
                         st.rerun()
                     except Exception as e:
@@ -1268,6 +1828,191 @@ with tab_workers:
                     finally:
                         conn.execute("PRAGMA foreign_keys = ON;")
                         conn.close()
+
+    # 3-2. 개별 근로자 상세 수정
+    with tab_w_edit:
+        st.markdown("#### ✏️ 개별 근로자 상세 정보 수정")
+        all_workers_edit = db_manager.get_all_workers()
+        if not all_workers_edit:
+            st.info("수정할 근로자가 존재하지 않습니다.")
+        else:
+            worker_opt_map = {f"[{w['worker_id']}] {w['name']} ({w['team'] or '팀없음'} / {w['trade'] or '직종없음'})": w for w in all_workers_edit}
+            selected_w_opt = st.selectbox("수정할 근로자를 선택하세요", list(worker_opt_map.keys()), key="select_worker_to_edit")
+            target_w = worker_opt_map[selected_w_opt]
+            
+            with st.form(key=f"form_edit_worker_{target_w['worker_id']}"):
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    e_name = st.text_input("성명", value=target_w["name"])
+                    e_worker_id = st.text_input("주민번호 (변경 시 관련 출역 기록도 자동 갱신됩니다)", value=target_w["worker_id"])
+                    e_team = st.text_input("소속팀", value=target_w["team"] or "")
+                    e_trade = st.text_input("직종/공종", value=target_w["trade"] or "")
+                    e_hire_date = st.text_input("입사일 (YYYY-MM-DD)", value=target_w["hire_date"])
+                with col_e2:
+                    e_resignation_date = st.text_input("퇴사일 (YYYY-MM-DD, 미퇴사 시 공란)", value=target_w["resignation_date"] or "")
+                    e_exclude_holiday = st.checkbox("주월차 수당 계산 제외", value=(target_w.get("exclude_holiday", 0) == 1))
+                    e_remarks = st.text_input("비고", value=target_w["remarks"] or "")
+                    st.info(f"💡 주민번호: {target_w['worker_id']} | 등록일: {target_w['hire_date']}")
+                
+                btn_save_single_worker = st.form_submit_button("💾 근로자 정보 수정 저장", type="primary", use_container_width=True)
+                if btn_save_single_worker:
+                    e_name = e_name.strip()
+                    e_worker_id = e_worker_id.strip()
+                    e_team = e_team.strip() or None
+                    e_trade = e_trade.strip() or None
+                    e_hire_date = e_hire_date.strip()
+                    e_resignation_date = e_resignation_date.strip() or None
+                    e_remarks = e_remarks.strip() or None
+                    
+                    if not e_name:
+                        st.error("성명을 입력해야 합니다.")
+                        st.stop()
+                    if not e_worker_id:
+                        st.error("주민번호를 입력해야 합니다.")
+                        st.stop()
+                    try:
+                        datetime.datetime.strptime(e_hire_date, "%Y-%m-%d")
+                    except ValueError:
+                        st.error("입사일 형식이 올바르지 않습니다. YYYY-MM-DD 형식이어야 합니다.")
+                        st.stop()
+                    if e_resignation_date:
+                        try:
+                            datetime.datetime.strptime(e_resignation_date, "%Y-%m-%d")
+                        except ValueError:
+                            st.error("퇴사일 형식이 올바르지 않습니다. YYYY-MM-DD 형식이어야 합니다.")
+                            st.stop()
+                            
+                    conn = db_manager.get_db_connection()
+                    conn.execute("PRAGMA foreign_keys = OFF;")
+                    cursor = conn.cursor()
+                    try:
+                        old_w_id = target_w["worker_id"]
+                        if e_worker_id != old_w_id:
+                            cursor.execute("SELECT COUNT(*) as cnt FROM workers WHERE worker_id = ?;", (e_worker_id,))
+                            if cursor.fetchone()["cnt"] > 0:
+                                st.error(f"오류: 변경하려는 주민번호({e_worker_id})가 이미 데이터베이스에 존재합니다.")
+                                st.stop()
+                            cursor.execute("UPDATE workers SET worker_id = ? WHERE worker_id = ?;", (e_worker_id, old_w_id))
+                            cursor.execute("UPDATE daily_attendance SET worker_id = ? WHERE worker_id = ?;", (e_worker_id, old_w_id))
+                            cursor.execute("UPDATE daily_custom_attendance SET worker_id = ? WHERE worker_id = ?;", (e_worker_id, old_w_id))
+                            cursor.execute("UPDATE monthly_status SET worker_id = ? WHERE worker_id = ?;", (e_worker_id, old_w_id))
+                            cursor.execute("UPDATE audit_logs SET worker_id = ? WHERE worker_id = ?;", (e_worker_id, old_w_id))
+                        
+                        ex_val = 1 if e_exclude_holiday else 0
+                        cursor.execute("""
+                            UPDATE workers
+                            SET name = ?, team = ?, trade = ?, exclude_holiday = ?, hire_date = ?, resignation_date = ?, remarks = ?
+                            WHERE worker_id = ?;
+                        """, (e_name, e_team, e_trade, ex_val, e_hire_date, e_resignation_date, e_remarks, e_worker_id))
+                        
+                        db_manager.log_audit(
+                            user_id=st.session_state.user_id,
+                            worker_id=e_worker_id,
+                            action="개별 근로자 상세 정보 수정",
+                            before_value=str(target_w),
+                            after_value=f"주민번호:{e_worker_id}, 성명:{e_name}, 팀:{e_team}, 직종:{e_trade}, 입사:{e_hire_date}, 퇴사:{e_resignation_date}, 주월차제외:{ex_val}",
+                            conn=conn
+                        )
+                        conn.commit()
+                        if "selected_ym" in st.session_state:
+                            try:
+                                calc_engine.recalculate_month(st.session_state.selected_ym, st.session_state.user_id)
+                            except Exception:
+                                pass
+                        st.success(f"✅ [{e_name}] 근로자 정보가 성공적으로 수정 반영되었습니다.")
+                        get_attendance_grid.clear()
+                        st.rerun()
+                    except Exception as ex_err:
+                        conn.rollback()
+                        st.error(f"저장 중 오류 발생: {ex_err}")
+                    finally:
+                        conn.execute("PRAGMA foreign_keys = ON;")
+                        conn.close()
+
+    # 3-3. 근로자 삭제 (팀별 필터링 및 단일/다중 일괄 삭제)
+    with tab_w_delete:
+        st.markdown("#### 🗑️ 근로자 삭제 (팀별 필터 및 편리한 일괄 선택 기능)")
+        
+        all_workers_del = db_manager.get_all_workers()
+        if not all_workers_del:
+            st.info("삭제할 근로자가 존재하지 않습니다.")
+        else:
+            # 팀 목록 추출
+            teams_del = sorted(list(set([w["team"] for w in all_workers_del if w["team"]])))
+            col_dt1, col_dt2 = st.columns([1, 2])
+            with col_dt1:
+                sel_del_team = st.selectbox("🎯 팀 필터 선택 (원하는 팀 근로자만 선택 가능)", ["전체 (모든 팀)"] + teams_del, key="select_del_team_filter")
+            
+            # 선택한 팀에 따라 근로자 목록 필터링
+            if sel_del_team != "전체 (모든 팀)":
+                filtered_del_workers = [w for w in all_workers_del if w["team"] == sel_del_team]
+            else:
+                filtered_del_workers = all_workers_del
+                
+            with col_dt2:
+                cnt_res = len([w for w in filtered_del_workers if w.get('resignation_date')])
+                st.info(f"💡 현재 선택된 **[{sel_del_team}]** 대상 근로자: 총 **{len(filtered_del_workers)}명** (재직 {len(filtered_del_workers) - cnt_res}명 / 퇴사 {cnt_res}명)")
+                
+            # 옵션 맵 생성 (팀명 / 성명 / 주민번호 / 퇴사 여부 명확 표기)
+            del_opt_map = {}
+            for w in filtered_del_workers:
+                r_tag = f"🔴 퇴사 ({w['resignation_date']})" if w.get('resignation_date') else "재직"
+                key_str = f"[{w['team'] or '팀없음'}] {w['name']} (주민번호: {w['worker_id']} / 직종: {w['trade'] or '직종없음'} / {r_tag})"
+                del_opt_map[key_str] = w['worker_id']
+
+            # 세션 상태 안전 초기화 및 유지
+            if "selected_del_keys_state" not in st.session_state:
+                st.session_state["selected_del_keys_state"] = []
+
+            # 콜백 함수 정의 (위젯 상태 변경 예외 차단)
+            def cb_sel_all_team(all_keys):
+                st.session_state["selected_del_keys_state"] = all_keys
+
+            def cb_sel_resigned_team(res_keys):
+                st.session_state["selected_del_keys_state"] = res_keys
+
+            def cb_clear_sel_team():
+                st.session_state["selected_del_keys_state"] = []
+
+            # 편리한 버튼식 일괄 선택 조작
+            col_b1, col_b2, col_b3 = st.columns([1, 1, 1])
+            with col_b1:
+                st.button(f"☑️ [{sel_del_team}] 전체 선택", use_container_width=True, key=f"btn_sel_all_{sel_del_team}", on_click=cb_sel_all_team, args=(list(del_opt_map.keys()),))
+            with col_b2:
+                st.button(f"🔴 [{sel_del_team}] 퇴사자만 선택", use_container_width=True, key=f"btn_sel_resigned_{sel_del_team}", on_click=cb_sel_resigned_team, args=([k for k in del_opt_map.keys() if "🔴 퇴사" in k],))
+            with col_b3:
+                st.button("🧹 선택 해제", use_container_width=True, key=f"btn_clear_sel_{sel_del_team}", on_click=cb_clear_sel_team)
+
+            # 유효한 기본 선택값 계산
+            valid_defaults = [k for k in st.session_state["selected_del_keys_state"] if k in del_opt_map]
+
+            selected_del_keys = st.multiselect(
+                "🗑️ 삭제할 근로자를 선택하세요 (여러 명 동시 선택 가능)",
+                options=list(del_opt_map.keys()),
+                default=valid_defaults,
+                key=f"ms_del_workers_{sel_del_team}"
+            )
+            if selected_del_keys:
+                selected_del_ids = [del_opt_map[k] for k in selected_del_keys if k in del_opt_map]
+                if selected_del_ids:
+                    st.warning(f"⚠️ **경고**: 선택하신 **{len(selected_del_ids)}명**의 근로자를 삭제하시면 대상자의 일별 공수, 수당, 마감 기록 등 관련 데이터가 **영구적으로 함께 삭제**됩니다.")
+                    confirm_del_check = st.checkbox(f"위 내용을 확인하였으며, 선택한 {len(selected_del_ids)}명의 근로자를 완전히 삭제합니다.", key=f"checkbox_confirm_del_{sel_del_team}")
+                    if confirm_del_check:
+                        if st.button(f"🗑️ 선택한 {len(selected_del_ids)}명의 근로자 영구 삭제 실행", type="primary", use_container_width=True, key=f"btn_confirm_del_{sel_del_team}"):
+                            try:
+                                deleted_cnt = db_manager.delete_multiple_workers(selected_del_ids, st.session_state.user_id)
+                                if "selected_ym" in st.session_state:
+                                    try:
+                                        calc_engine.recalculate_month(st.session_state.selected_ym, st.session_state.user_id)
+                                    except Exception:
+                                        pass
+                                st.session_state["selected_del_keys_state"] = []
+                                st.success(f"✅ {deleted_cnt}명의 근로자 및 관련 출역 기록이 성공적으로 영구 삭제되었습니다.")
+                                get_attendance_grid.clear()
+                                st.rerun()
+                            except Exception as del_err:
+                                st.error(f"삭제 작업 중 오류 발생: {del_err}")
+
     # 3-2. 근로자 일괄등록 (요청받은 핵심 신규 기능)
     with tab_w_bulk:
         st.markdown("#### 📥 엑셀 일괄 등록 및 업데이트")
@@ -1347,6 +2092,7 @@ with tab_workers:
                 new_w_hire = st.date_input("입사일", datetime.date.today())
                 new_w_resign = st.text_input("퇴사일 (YYYY-MM-DD 형식, 현재 재직중인 경우 빈칸)", value="")
                 new_w_remarks = st.text_input("비고 (특이사항)").strip()
+                new_w_exclude = st.checkbox("주휴/월차 지급 대상에서 제외", value=False)
             w_submit = st.form_submit_button("근로자 등록", disabled=is_w_disabled)
             if w_submit:
                 if not new_w_id or not new_w_name:
@@ -1364,6 +2110,7 @@ with tab_workers:
                             "has_lodging": 0,
                             "has_health": 0,
                             "is_team_leader": 0,
+                            "exclude_holiday": 1 if new_w_exclude else 0,
                             "hire_date": new_w_hire.strftime("%Y-%m-%d"),
                             "resignation_date": res_date,
                             "team": new_w_team if new_w_team else None,

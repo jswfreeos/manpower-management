@@ -68,16 +68,16 @@ def generate_worker_template() -> bytes:
     ws = wb.active
     ws.title = "근로자 일괄등록 양식"
     ws.views.sheetView[0].showGridLines = True
-    # 헤더 정의 (숙소, 보건, 팀장 제외, 사번 -> 주민번호, 비고 추가)
+    # 헤더 정의 (숙소, 보건, 팀장 제외, 사번 -> 주민번호, 주월차제외 추가)
     headers = [
         "주민번호*", "성명*", "소속팀", "직종/공종", 
-        "입사일(YYYY-MM-DD)*", "퇴사일(YYYY-MM-DD)", "비고"
+        "입사일(YYYY-MM-DD)*", "퇴사일(YYYY-MM-DD)", "주월차제외", "비고"
     ]
     ws.append(headers)
     # 샘플 데이터 추가
     sample_row = [
         "850315-1852212", "홍길동", "배관1팀", "배관공",
-        "2026-01-01", "", "특이사항 없음"
+        "2026-01-01", "", "", "특이사항 없음"
     ]
     ws.append(sample_row)
     # 서식 적용
@@ -112,7 +112,8 @@ def generate_worker_template() -> bytes:
     ws.column_dimensions["D"].width = 18
     ws.column_dimensions["E"].width = 25
     ws.column_dimensions["F"].width = 25
-    ws.column_dimensions["G"].width = 30
+    ws.column_dimensions["G"].width = 15
+    ws.column_dimensions["H"].width = 30
     # 안내 메시지 시트 추가
     ws_guide = wb.create_sheet(title="작성 안내")
     ws_guide.views.sheetView[0].showGridLines = True
@@ -125,6 +126,7 @@ def generate_worker_template() -> bytes:
     ws_guide.append(["직종/공종", "실무 직종명 (예: 배관공, 계장공, 조공)"])
     ws_guide.append(["입사일*", "근로 계약상의 입사 연월일 (필수, YYYY-MM-DD 형식, 예: 2026-05-15)"])
     ws_guide.append(["퇴사일", "퇴사한 근로자일 경우 퇴사 연월일 입력 (YYYY-MM-DD 형식, 재직 중이면 공란)"])
+    ws_guide.append(["주월차제외", "주휴/월차 계산 대상에서 제외할지 여부 ('제외' 또는 '1' 기입 시 제외되며 공란 시 대상 포함)"])
     ws_guide.append(["비고", "근로자 특이사항 및 메모 (선택사항)"])
     # 가이드 헤더 스타일링
     for c in range(1, 3):
@@ -133,7 +135,7 @@ def generate_worker_template() -> bytes:
         cell.font = header_font
         cell.alignment = align_center
         cell.border = thin_border
-    for r in range(2, 9):
+    for r in range(2, 10):
         ws_guide.cell(row=r, column=1).font = Font(name="맑은 고딕", size=10, bold=True)
         ws_guide.cell(row=r, column=1).border = thin_border
         ws_guide.cell(row=r, column=2).font = data_font
@@ -259,6 +261,16 @@ def parse_and_import_workers(file_content: bytes, user_id: str) -> Tuple[int, in
             errors.append(f"{row_num}행: 성명이 비어있습니다.")
             continue
         name = str(name_raw).strip()
+        # 2.5 주월차제외 여부 독출
+        exclude_val_raw = row.get("주월차제외")
+        if "주월차제외" not in row and "주월차 제외" in row:
+            exclude_val_raw = row.get("주월차 제외")
+        exclude_holiday = 0
+        if not pd.isna(exclude_val_raw):
+            val_str = str(exclude_val_raw).strip().lower()
+            if val_str in ("1", "1.0", "true", "o", "y", "yes", "예", "제외"):
+                exclude_holiday = 1
+
         # 3. 날짜 검증 (입사일)
         hire_date_raw = row.get("입사일(YYYY-MM-DD)*")
         if pd.isna(hire_date_raw) or str(hire_date_raw).strip() in ("", "nan", "NaT", "None"):
@@ -375,19 +387,17 @@ def import_daily_excel(file_content: bytes, file_name: str, date_str: str, user_
         if not name_clean and not id_clean:
             # 사번과 이름이 모두 비어있는 행은 그냥 스킵
             continue
-        if pd.isna(raw_normal):
-            failure_reason = "일반공수 값이 비어있습니다."
-        else:
-            try:
-                val_normal = float(raw_normal)
-                val_overtime = float(raw_overtime) if not pd.isna(raw_overtime) else 0.0
-                if val_normal < 0.0 or val_overtime < 0.0:
-                    failure_reason = f"공수 값은 음수일 수 없습니다. (일반:{val_normal}, 연장:{val_overtime})"
-                elif val_normal > 2.0 or val_overtime > 2.0:
-                    failure_reason = f"단일 공수 가중치 제한(2.0)을 초과했습니다. (일반:{val_normal}, 연장:{val_overtime})"
-                elif (val_normal + val_overtime) > config.MAX_DAILY_TOTAL_HOURS:
-                    failure_reason = f"하루 최대 공수 시간 제한({config.MAX_DAILY_TOTAL_HOURS})을 초과했습니다. (합계:{val_normal + val_overtime})"
-            except ValueError:
+        # 일반공수 값이 비어있는 경우(누락공수 등) 0.0으로 기본 처리
+        try:
+            val_normal = float(raw_normal) if not pd.isna(raw_normal) else 0.0
+            val_overtime = float(raw_overtime) if not pd.isna(raw_overtime) else 0.0
+            if val_normal < 0.0 or val_overtime < 0.0:
+                failure_reason = f"공수 값은 음수일 수 없습니다. (일반:{val_normal}, 연장:{val_overtime})"
+            elif val_normal > 2.0 or val_overtime > 2.0:
+                failure_reason = f"단일 공수 가중치 제한(2.0)을 초과했습니다. (일반:{val_normal}, 연장:{val_overtime})"
+            elif (val_normal + val_overtime) > config.MAX_DAILY_TOTAL_HOURS:
+                failure_reason = f"하루 최대 공수 시간 제한({config.MAX_DAILY_TOTAL_HOURS})을 초과했습니다. (합계:{val_normal + val_overtime})"
+        except ValueError:
                 failure_reason = f"공수 값 형식이 올바르지 않습니다. (일반:{raw_normal}, 연장:{raw_overtime})"
         if failure_reason:
             failures.append({
@@ -462,21 +472,22 @@ def import_daily_excel(file_content: bytes, file_name: str, date_str: str, user_
     conn.close()
     # 매칭 성공 건 일괄 벌크 저장
     if records_to_save:
-        db_manager.save_attendance_bulk(records_to_save, user_id)
+        db_manager.save_attendance_bulk(records_to_save, user_id, force_overwrite=True)
     db_manager.log_import(file_name, user_id, len(records_to_save), "성공" if not failures else "일부 매칭실패", 
                           f"성공: {len(records_to_save)}건, 실패: {len(failures)}건")
     return len(records_to_save), failures
 # 월말 보고서(Excel) 내보내기 기능
-def export_monthly_excel(df_pivot: pd.DataFrame, year_month: str) -> bytes:
-    """월말 공수 정산표 피벗 데이터를 예쁜 서식을 갖춘 엑셀 바이너리로 변환하여 반환합니다."""
+def export_monthly_excel(df_pivot: pd.DataFrame, year_month: str, df_custom: pd.DataFrame = None) -> bytes:
+    """월말 공수 정산표 및 추가 수당 집계표 데이터를 시트별 서식을 갖춘 엑셀 바이너리로 변환합니다."""
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"{year_month} 공수정산표"
-    ws.views.sheetView[0].showGridLines = True
-    # 헤더 및 스타일 정의
+    ws1 = wb.active
+    ws1.title = f"{year_month} 공수정산표"
+    
     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid") # Navy
     header_font = Font(name="맑은 고딕", size=9, bold=True, color="FFFFFF")
     data_font = Font(name="맑은 고딕", size=9)
+    total_fill = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
+    total_font = Font(name="맑은 고딕", size=9, bold=True)
     align_center = Alignment(horizontal="center", vertical="center")
     thin_border = Border(
         left=Side(style='thin', color='D9D9D9'),
@@ -484,46 +495,58 @@ def export_monthly_excel(df_pivot: pd.DataFrame, year_month: str) -> bytes:
         top=Side(style='thin', color='D9D9D9'),
         bottom=Side(style='thin', color='D9D9D9')
     )
-    # pandas DataFrame을 엑셀로 기입
-    headers = list(df_pivot.columns)
-    ws.append(headers)
-    for idx, row in df_pivot.iterrows():
-        ws.append(list(row))
-    # 헤더 스타일링
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = align_center
-        cell.border = thin_border
-    # 데이터 스타일링
-    total_fill = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
-    total_font = Font(name="맑은 고딕", size=9, bold=True)
-    for row_idx in range(2, ws.max_row + 1):
-        is_total_row = (ws.cell(row=row_idx, column=1).value == "일일 합계")
+
+    def write_and_style_sheet(ws, df):
+        ws.views.sheetView[0].showGridLines = True
+        headers = list(df.columns)
+        ws.append(headers)
+        for idx, row in df.iterrows():
+            ws.append(list(row))
         for col_idx in range(1, len(headers) + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cell.border = thin_border
-            if is_total_row:
-                cell.font = total_font
-                cell.fill = total_fill
-            else:
-                cell.font = data_font
-            # 정렬 설정
-            col_name = headers[col_idx - 1]
+            cell = ws.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
             cell.alignment = align_center
-    # 열 너비 자동 조정
-    for col in ws.columns:
-        col_name = col[0].value
-        col_letter = openpyxl.utils.get_column_letter(col[0].column)
-        if col_name in ["사번", "성명"]:
-            ws.column_dimensions[col_letter].width = 12
-        elif col_name in ["팀", "직종"]:
-            ws.column_dimensions[col_letter].width = 15
-        elif col_name in ["출역", "연장", "주차", "월차", "숙소", "보건", "팀장", "기타", "총공수"]:
-            ws.column_dimensions[col_letter].width = 11
-        else:
-            ws.column_dimensions[col_letter].width = 6 # 날짜 컬럼은 좁게
+            cell.border = thin_border
+        resigned_fill = PatternFill(start_color="FDE8E8", end_color="FDE8E8", fill_type="solid") # Soft Red
+        resigned_font = Font(name="맑은 고딕", size=9, color="9C0006", bold=True)
+        for row_idx in range(2, ws.max_row + 1):
+            is_total_row = (ws.cell(row=row_idx, column=1).value == "일일 합계")
+            row_name_val = str(ws.cell(row=row_idx, column=2).value or "")
+            row_status_val = str(ws.cell(row=row_idx, column=3).value or "")
+            is_resigned_row = ("(퇴사" in row_name_val) or ("퇴사" in row_status_val)
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.border = thin_border
+                if is_total_row:
+                    cell.font = total_font
+                    cell.fill = total_fill
+                elif is_resigned_row:
+                    cell.font = resigned_font
+                    cell.fill = resigned_fill
+                else:
+                    cell.font = data_font
+                cell.alignment = align_center
+        for col in ws.columns:
+            col_name = col[0].value
+            col_letter = openpyxl.utils.get_column_letter(col[0].column)
+            if col_name in ["주민번호", "사번", "성명"]:
+                ws.column_dimensions[col_letter].width = 12
+            elif col_name in ["팀", "직종"]:
+                ws.column_dimensions[col_letter].width = 15
+            elif col_name in ["출역", "연장", "주차", "월차", "숙소", "보건", "팀장", "기타", "총공수", "추가수당 합계"] or (col_name and str(col_name).endswith("수당")):
+                ws.column_dimensions[col_letter].width = 14
+            else:
+                ws.column_dimensions[col_letter].width = 6
+
+    # Sheet 1: 메인 공수정산표
+    write_and_style_sheet(ws1, df_pivot)
+
+    # Sheet 2: 추가 수당 집계표 (df_custom이 존재하고 비어있지 않은 경우)
+    if df_custom is not None and not df_custom.empty:
+        ws2 = wb.create_sheet(title=f"{year_month} 추가수당 집계표")
+        write_and_style_sheet(ws2, df_custom)
+
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()

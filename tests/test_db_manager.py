@@ -94,3 +94,65 @@ def test_check_constraints():
         assert False, "Should have raised SQLite CHECK constraint exception"
     except Exception:
         pass
+
+def test_delete_attendance_by_date():
+    """특정 날짜 데이터 일괄 삭제(전체, 팀별, 특정 수당만 선택 삭제) 테스트"""
+    records = [
+        {"date": "20260715", "worker_id": "T001", "normal_weight": 1.0, "overtime_weight": 0.5, "lodging_weight": 1.0, "health_weight": 1.0},
+        {"date": "20260715", "worker_id": "T002", "normal_weight": 1.0, "overtime_weight": 0.0, "lodging_weight": 1.0, "health_weight": 0.0},
+        {"date": "20260716", "worker_id": "T001", "normal_weight": 1.0, "overtime_weight": 0.0},
+    ]
+    db_manager.save_attendance_bulk(records, "TEST_USER")
+    db_manager.add_custom_weight_type("danger", "위험")
+    db_manager.save_daily_custom_attendance("20260715", "T001", "danger", 1.0)
+
+    summary_before = db_manager.get_date_attendance_summary("20260715")
+    assert summary_before["attendance_count"] == 2
+    assert summary_before["custom_count"] == 1
+
+    # 1. 특정 수당(숙소수당 + 위험수당)만 선택 삭제 테스트 (일반공수 및 보건수당은 보존되어야 함)
+    res_sel = db_manager.delete_attendance_by_date(
+        "20260715", "TEST_USER", team="전체", target_fields=["lodging_weight", "custom_danger"]
+    )
+    assert res_sel["deleted_attendance"] == 2
+    assert res_sel["deleted_custom"] == 1
+    summary_after_sel = db_manager.get_date_attendance_summary("20260715")
+    assert summary_after_sel["custom_count"] == 0
+    rec_t001 = [r for r in summary_after_sel["records"] if r["worker_id"] == "T001"][0]
+    assert rec_t001["lodging_weight"] == 0.0
+    assert rec_t001["normal_weight"] == 1.0
+    assert rec_t001["health_weight"] == 1.0
+
+    # 2. 특정 팀('개발팀' -> T002)만 전체 삭제 테스트
+    res_team = db_manager.delete_attendance_by_date("20260715", "TEST_USER", team="개발팀")
+    assert res_team["deleted_attendance"] == 1
+    summary_after_team = db_manager.get_date_attendance_summary("20260715")
+    assert summary_after_team["attendance_count"] == 1
+
+    # 3. 해당 날짜 전체 삭제 테스트
+    res_all = db_manager.delete_attendance_by_date("2026-07-15", "TEST_USER", team="전체")
+    assert res_all["deleted_attendance"] == 1
+    summary_after_all = db_manager.get_date_attendance_summary("20260715")
+    assert summary_after_all["attendance_count"] == 0
+
+    # 4. 다른 날짜(20260716) 데이터는 그대로 보존되었는지 확인
+    summary_other_date = db_manager.get_date_attendance_summary("20260716")
+    assert summary_other_date["attendance_count"] == 1
+
+def test_lock_unlock_and_holidays():
+    """월 마감/해제 및 공휴일/결근면제일 추가/삭제 기능 검증"""
+    assert db_manager.is_month_locked("2026-07") is False
+    db_manager.lock_month("2026-07", "TEST_USER")
+    assert db_manager.is_month_locked("2026-07") is True
+    db_manager.unlock_month("2026-07", "TEST_USER")
+    assert db_manager.is_month_locked("2026-07") is False
+
+    db_manager.add_holiday("20260717", "제헌절")
+    holidays = db_manager.get_holidays("2026-07")
+    assert any(h["date"] == "20260717" for h in holidays)
+    db_manager.remove_holiday("20260717")
+
+    db_manager.add_excused_date("20260718", "우천셧다운")
+    excused = db_manager.get_excused_dates("2026-07")
+    assert any(e["date"] == "20260718" for e in excused)
+    db_manager.remove_excused_date("20260718")

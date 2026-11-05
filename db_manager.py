@@ -51,6 +51,7 @@ def init_db():
         has_lodging INTEGER NOT NULL DEFAULT 0,
         has_health INTEGER NOT NULL DEFAULT 0,
         is_team_leader INTEGER NOT NULL DEFAULT 0,
+        exclude_holiday INTEGER NOT NULL DEFAULT 0,
         hire_date TEXT NOT NULL,
         resignation_date TEXT,
         team TEXT,
@@ -66,11 +67,11 @@ def init_db():
         worker_id TEXT,
         normal_weight REAL NOT NULL CHECK (normal_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
         overtime_weight REAL NOT NULL CHECK (overtime_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
-        lodging_weight REAL NOT NULL CHECK (lodging_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
-        health_weight REAL NOT NULL CHECK (health_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
-        leader_weight REAL NOT NULL CHECK (leader_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
-        weekly_holiday REAL NOT NULL DEFAULT 0.0 CHECK (weekly_holiday BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
-        monthly_holiday REAL NOT NULL DEFAULT 0.0 CHECK (monthly_holiday BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
+        lodging_weight REAL NOT NULL,
+        health_weight REAL NOT NULL,
+        leader_weight REAL NOT NULL,
+        weekly_holiday REAL NOT NULL DEFAULT 0.0,
+        monthly_holiday REAL NOT NULL DEFAULT 0.0,
         status TEXT NOT NULL DEFAULT '출근',
         is_weekly_manual INTEGER NOT NULL DEFAULT 0,
         is_monthly_manual INTEGER NOT NULL DEFAULT 0,
@@ -93,6 +94,12 @@ def init_db():
         cursor.execute("SELECT deduction FROM daily_attendance LIMIT 1;")
     except sqlite3.OperationalError:
         cursor.execute("ALTER TABLE daily_attendance ADD COLUMN deduction REAL NOT NULL DEFAULT 0.0;")
+    
+    # 마이그레이션: exclude_holiday 컬럼이 기존 DB에 없으면 동적으로 추가
+    try:
+        cursor.execute("SELECT exclude_holiday FROM workers LIMIT 1;")
+    except sqlite3.OperationalError:
+        cursor.execute("ALTER TABLE workers ADD COLUMN exclude_holiday INTEGER NOT NULL DEFAULT 0;")
     
     # 3. 월별 공수 요약 테이블
     cursor.execute("""
@@ -220,7 +227,7 @@ def init_db():
         date TEXT,
         worker_id TEXT,
         type_id TEXT,
-        weight REAL NOT NULL CHECK (weight >= 0.0),
+        weight REAL NOT NULL,
         PRIMARY KEY (date, worker_id, type_id),
         FOREIGN KEY (worker_id) REFERENCES workers(worker_id) ON DELETE CASCADE,
         FOREIGN KEY (type_id) REFERENCES custom_weight_types(type_id) ON DELETE CASCADE
@@ -261,6 +268,74 @@ def init_db():
     );
     """)
         
+
+    # 마이그레이션: daily_attendance 테이블 제약조건 제거 (기존 DB 마이그레이션)
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_attendance';")
+    da_sql_row = cursor.fetchone()
+    if da_sql_row and "CHECK (lodging_weight" in da_sql_row["sql"]:
+        try:
+            cursor.execute("PRAGMA foreign_keys = OFF;")
+            cursor.execute("ALTER TABLE daily_attendance RENAME TO _daily_attendance_old;")
+            cursor.execute(f"""
+            CREATE TABLE daily_attendance (
+                date TEXT,
+                worker_id TEXT,
+                normal_weight REAL NOT NULL CHECK (normal_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
+                overtime_weight REAL NOT NULL CHECK (overtime_weight BETWEEN {config.ALLOWED_MIN_WEIGHT} AND {config.ALLOWED_MAX_WEIGHT}),
+                lodging_weight REAL NOT NULL,
+                health_weight REAL NOT NULL,
+                leader_weight REAL NOT NULL,
+                weekly_holiday REAL NOT NULL DEFAULT 0.0,
+                monthly_holiday REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT '출근',
+                is_weekly_manual INTEGER NOT NULL DEFAULT 0,
+                is_monthly_manual INTEGER NOT NULL DEFAULT 0,
+                prev_month_missing REAL NOT NULL DEFAULT 0.0,
+                deduction REAL NOT NULL DEFAULT 0.0,
+                version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (date, worker_id),
+                FOREIGN KEY (worker_id) REFERENCES workers(worker_id) ON DELETE CASCADE
+            );
+            """)
+            cursor.execute("""
+            INSERT INTO daily_attendance (
+                date, worker_id, normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight,
+                weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, prev_month_missing, deduction, version
+            ) SELECT 
+                date, worker_id, normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight,
+                weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, prev_month_missing, deduction, version
+            FROM _daily_attendance_old;
+            """)
+            cursor.execute("DROP TABLE _daily_attendance_old;")
+        except Exception as e:
+            raise e
+        finally:
+            cursor.execute("PRAGMA foreign_keys = ON;")
+
+    # 마이그레이션: daily_custom_attendance 테이블 제약조건 제거
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_custom_attendance';")
+    dca_sql_row = cursor.fetchone()
+    if dca_sql_row and "CHECK (weight" in dca_sql_row["sql"]:
+        try:
+            cursor.execute("PRAGMA foreign_keys = OFF;")
+            cursor.execute("ALTER TABLE daily_custom_attendance RENAME TO _daily_custom_attendance_old;")
+            cursor.execute("""
+            CREATE TABLE daily_custom_attendance (
+                date TEXT,
+                worker_id TEXT,
+                type_id TEXT,
+                weight REAL NOT NULL,
+                PRIMARY KEY (date, worker_id, type_id),
+                FOREIGN KEY (worker_id) REFERENCES workers(worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (type_id) REFERENCES custom_weight_types(type_id) ON DELETE CASCADE
+            );
+            """)
+            cursor.execute("INSERT INTO daily_custom_attendance SELECT date, worker_id, type_id, weight FROM _daily_custom_attendance_old;")
+            cursor.execute("DROP TABLE _daily_custom_attendance_old;")
+        except Exception as e:
+            raise e
+        finally:
+            cursor.execute("PRAGMA foreign_keys = ON;")
     conn.commit()
     conn.close()
 
@@ -396,6 +471,7 @@ def bulk_insert_workers(workers_list: List[Dict[str, Any]], user_id: str) -> Tup
             has_lodging = w.get("has_lodging", 0)
             has_health = w.get("has_health", 0)
             is_team_leader = w.get("is_team_leader", 0)
+            exclude_holiday = w.get("exclude_holiday", 0)
             hire_date = w["hire_date"]
             resignation_date = w.get("resignation_date")
             team = w.get("team")
@@ -414,6 +490,7 @@ def bulk_insert_workers(workers_list: List[Dict[str, Any]], user_id: str) -> Tup
                     existing["has_lodging"] != has_lodging or
                     existing["has_health"] != has_health or
                     existing["is_team_leader"] != is_team_leader or
+                    existing.get("exclude_holiday", 0) != exclude_holiday or
                     existing["hire_date"] != hire_date or
                     existing["resignation_date"] != resignation_date or
                     existing["team"] != team or
@@ -423,10 +500,10 @@ def bulk_insert_workers(workers_list: List[Dict[str, Any]], user_id: str) -> Tup
                 if changed:
                     cursor.execute("""
                         UPDATE workers
-                        SET name = ?, has_lodging = ?, has_health = ?, is_team_leader = ?,
+                        SET name = ?, has_lodging = ?, has_health = ?, is_team_leader = ?, exclude_holiday = ?,
                             hire_date = ?, resignation_date = ?, team = ?, trade = ?, remarks = ?
                         WHERE worker_id = ?;
-                    """, (name, has_lodging, has_health, is_team_leader, hire_date, resignation_date, team, trade, remarks, worker_id))
+                    """, (name, has_lodging, has_health, is_team_leader, exclude_holiday, hire_date, resignation_date, team, trade, remarks, worker_id))
                     
                     before_str = str(existing)
                     after_str = str(w)
@@ -434,9 +511,9 @@ def bulk_insert_workers(workers_list: List[Dict[str, Any]], user_id: str) -> Tup
                     updated_count += 1
             else:
                 cursor.execute("""
-                    INSERT INTO workers (worker_id, name, has_lodging, has_health, is_team_leader, hire_date, resignation_date, team, trade, remarks)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (worker_id, name, has_lodging, has_health, is_team_leader, hire_date, resignation_date, team, trade, remarks))
+                    INSERT INTO workers (worker_id, name, has_lodging, has_health, is_team_leader, exclude_holiday, hire_date, resignation_date, team, trade, remarks)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (worker_id, name, has_lodging, has_health, is_team_leader, exclude_holiday, hire_date, resignation_date, team, trade, remarks))
                 
                 log_audit(user_id, worker_id, "근로자 일괄 신규 등록", None, str(w), conn=conn)
                 added_count += 1
@@ -450,6 +527,55 @@ def bulk_insert_workers(workers_list: List[Dict[str, Any]], user_id: str) -> Tup
         conn.close()
         
     return added_count, updated_count
+
+def delete_worker(worker_id: str, user_id: str):
+    """특정 근로자 및 관련 출역 기록을 안전하게 삭제합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys = OFF;")
+        cursor.execute("SELECT * FROM workers WHERE worker_id = ?;", (worker_id,))
+        w_row = cursor.fetchone()
+        if w_row:
+            log_audit(user_id, worker_id, "근로자 정보 삭제", str(dict(w_row)), "삭제 완료", conn=conn)
+            cursor.execute("DELETE FROM daily_attendance WHERE worker_id = ?;", (worker_id,))
+            cursor.execute("DELETE FROM daily_custom_attendance WHERE worker_id = ?;", (worker_id,))
+            cursor.execute("DELETE FROM monthly_status WHERE worker_id = ?;", (worker_id,))
+            cursor.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.close()
+
+def delete_multiple_workers(worker_id_list: list, user_id: str) -> int:
+    """여러 명의 근로자 및 관련 출역 기록을 일괄 삭제합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    deleted_count = 0
+    try:
+        cursor.execute("PRAGMA foreign_keys = OFF;")
+        for w_id in worker_id_list:
+            cursor.execute("SELECT * FROM workers WHERE worker_id = ?;", (w_id,))
+            w_row = cursor.fetchone()
+            if w_row:
+                log_audit(user_id, w_id, "근로자 정보 일괄 삭제", str(dict(w_row)), "삭제 완료", conn=conn)
+                cursor.execute("DELETE FROM daily_attendance WHERE worker_id = ?;", (w_id,))
+                cursor.execute("DELETE FROM daily_custom_attendance WHERE worker_id = ?;", (w_id,))
+                cursor.execute("DELETE FROM monthly_status WHERE worker_id = ?;", (w_id,))
+                cursor.execute("DELETE FROM workers WHERE worker_id = ?;", (w_id,))
+                deleted_count += 1
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.close()
+    return deleted_count
+
 
 # 마감 관리 기능
 def is_month_locked(year_month: str) -> bool:
@@ -481,10 +607,11 @@ def unlock_month(year_month: str, user_id: str):
     log_audit(user_id, None, f"{year_month} 마감 해제")
 
 # 일일 공수 관리 및 낙관적 락(Optimistic Lock)
-def save_attendance_bulk(data_list: List[Dict[str, Any]], user_id: str):
+def save_attendance_bulk(data_list: List[Dict[str, Any]], user_id: str, force_overwrite: bool = True):
     """
-    일일 출역 데이터를 낙관적 동시성 제어(Optimistic Lock)를 활용해 대량 저장합니다.
-    동시성 충돌 감지 시 Exception을 발생시킵니다.
+    일일 출역 데이터를 대량 저장합니다.
+    force_overwrite=True일 경우 버전 충돌을 무시하고 덮어씁니다. (Excel 업로드 등)
+    force_overwrite=False일 경우 동시성 충돌 감지 시 Exception을 발생시킵니다.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -518,7 +645,7 @@ def save_attendance_bulk(data_list: List[Dict[str, Any]], user_id: str):
             
             if row:
                 db_version = row["version"]
-                if db_version != version:
+                if not force_overwrite and db_version != version:
                     # 충돌 감지
                     raise sqlite3.OperationalError(
                         f"동시성 편집 충돌 감지! [근로자 사번: {worker_id}, 날짜: {date}] "
@@ -526,21 +653,31 @@ def save_attendance_bulk(data_list: List[Dict[str, Any]], user_id: str):
                     )
                 
                 # 업데이트 및 버전 증분
-                cursor.execute("""
-                    UPDATE daily_attendance
-                    SET normal_weight = ?, overtime_weight = ?, lodging_weight = ?,
-                        health_weight = ?, leader_weight = ?, weekly_holiday = ?, monthly_holiday = ?, status = ?,
-                        is_weekly_manual = ?, is_monthly_manual = ?, prev_month_missing = ?, deduction = ?, version = version + 1
-                    WHERE date = ? AND worker_id = ? AND version = ?;
-                """, (normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight,
-                      weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, prev_month_missing, deduction, date, worker_id, version))
+                if force_overwrite:
+                    cursor.execute("""
+                        UPDATE daily_attendance
+                        SET normal_weight = ?, overtime_weight = ?, lodging_weight = ?,
+                            health_weight = ?, leader_weight = ?, weekly_holiday = ?, monthly_holiday = ?, status = ?,
+                            is_weekly_manual = ?, is_monthly_manual = ?, prev_month_missing = ?, deduction = ?, version = version + 1
+                        WHERE date = ? AND worker_id = ?;
+                    """, (normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight,
+                          weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, prev_month_missing, deduction, date, worker_id))
+                else:
+                    cursor.execute("""
+                        UPDATE daily_attendance
+                        SET normal_weight = ?, overtime_weight = ?, lodging_weight = ?,
+                            health_weight = ?, leader_weight = ?, weekly_holiday = ?, monthly_holiday = ?, status = ?,
+                            is_weekly_manual = ?, is_monthly_manual = ?, prev_month_missing = ?, deduction = ?, version = version + 1
+                        WHERE date = ? AND worker_id = ? AND version = ?;
+                    """, (normal_weight, overtime_weight, lodging_weight, health_weight, leader_weight,
+                          weekly_holiday, monthly_holiday, status, is_weekly_manual, is_monthly_manual, prev_month_missing, deduction, date, worker_id, version))
                 
                 if cursor.rowcount == 0:
                     raise sqlite3.OperationalError(
                         f"업데이트 충돌! [근로자 사번: {worker_id}, 날짜: {date}] "
                         f"실제 업데이트가 이루어지지 않았습니다."
                     )
-                log_audit(user_id, worker_id, f"{date} 공수 수정", before_value=f"Ver:{version}", after_value=f"Ver:{version+1}", conn=conn)
+                log_audit(user_id, worker_id, f"{date} 공수 수정", before_value=f"Ver:{db_version}", after_value=f"Ver:{db_version+1}", conn=conn)
             else:
                 # 신규 등록
                 cursor.execute("""
@@ -558,6 +695,226 @@ def save_attendance_bulk(data_list: List[Dict[str, Any]], user_id: str):
     except Exception as e:
         conn.rollback()
         log_system_error(user_id, f"출역 일괄 저장 실패: {e}", traceback.format_exc(), conn=conn)
+        raise e
+    finally:
+        conn.close()
+
+def get_date_attendance_summary(date_str: str, team: str = None) -> Dict[str, Any]:
+    """특정 날짜(YYYYMMDD 또는 YYYY-MM-DD)에 저장된 출역 및 추가수당 데이터 건수와 대상 인원을 조회합니다."""
+    date_clean = str(date_str).replace("-", "").replace("/", "").strip()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        custom_types = [dict(r) for r in cursor.execute("SELECT * FROM custom_weight_types ORDER BY type_id ASC;").fetchall()]
+        if team and team != "전체":
+            cursor.execute("""
+                SELECT a.worker_id, w.name, w.team, a.normal_weight, a.overtime_weight,
+                       a.prev_month_missing, a.deduction,
+                       a.weekly_holiday, a.monthly_holiday, a.lodging_weight, a.health_weight, a.leader_weight
+                FROM daily_attendance a
+                JOIN workers w ON a.worker_id = w.worker_id
+                WHERE a.date = ? AND w.team = ?;
+            """, (date_clean, team))
+            att_rows = [dict(r) for r in cursor.fetchall()]
+
+            cursor.execute("""
+                SELECT c.worker_id, c.type_id, c.weight
+                FROM daily_custom_attendance c
+                JOIN workers w ON c.worker_id = w.worker_id
+                WHERE c.date = ? AND w.team = ?;
+            """, (date_clean, team))
+            cust_rows = [dict(r) for r in cursor.fetchall()]
+        else:
+            cursor.execute("""
+                SELECT a.worker_id, w.name, w.team, a.normal_weight, a.overtime_weight,
+                       a.prev_month_missing, a.deduction,
+                       a.weekly_holiday, a.monthly_holiday, a.lodging_weight, a.health_weight, a.leader_weight
+                FROM daily_attendance a
+                LEFT JOIN workers w ON a.worker_id = w.worker_id
+                WHERE a.date = ?;
+            """, (date_clean,))
+            att_rows = [dict(r) for r in cursor.fetchall()]
+
+            cursor.execute("""
+                SELECT c.worker_id, c.type_id, c.weight
+                FROM daily_custom_attendance c
+                WHERE c.date = ?;
+            """, (date_clean,))
+            cust_rows = [dict(r) for r in cursor.fetchall()]
+
+        # 각 행에 커스텀 수당 값 병합
+        att_by_worker = {r["worker_id"]: r for r in att_rows}
+        for ct in custom_types:
+            for r in att_rows:
+                r[f"custom_{ct['type_id']}"] = 0.0
+        for cr in cust_rows:
+            wid = cr["worker_id"]
+            if wid in att_by_worker:
+                att_by_worker[wid][f"custom_{cr['type_id']}"] = cr["weight"]
+
+        return {
+            "date": date_clean,
+            "attendance_count": len(att_rows),
+            "custom_count": len(cust_rows),
+            "records": att_rows,
+            "custom_records": cust_rows,
+            "custom_types": custom_types
+        }
+    finally:
+        conn.close()
+
+def delete_attendance_by_date(date_str: str, user_id: str, team: str = None, target_fields: List[str] = None) -> Dict[str, int]:
+    """
+    특정 날짜(YYYYMMDD 또는 YYYY-MM-DD)의 출역/공수/수당 데이터를 일괄 또는 선택 항목만 삭제(초기화)합니다.
+    - team이 지정된 경우('전체'가 아닌 경우) 해당 팀 소속 근로자의 데이터만 삭제합니다.
+    - target_fields가 None이거나 비어있으면 해당 날짜의 전체 데이터를 삭제합니다.
+    - target_fields가 지정된 경우(예: ['lodging_weight', 'health_weight', 'custom_danger']) 선택된 수당/공수만 0으로 초기화합니다.
+    """
+    date_clean = str(date_str).replace("-", "").replace("/", "").strip()
+    if len(date_clean) != 8:
+        raise ValueError(f"올바르지 않은 날짜 형식입니다: {date_str}")
+
+    year_month = f"{date_clean[:4]}-{date_clean[4:6]}"
+    if is_month_locked(year_month):
+        raise PermissionError(f"{year_month} 월은 이미 마감되어 삭제할 수 없습니다.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # 1. 특정 수당/공수 항목만 선택하여 삭제(0으로 초기화)하는 경우
+        if target_fields:
+            std_fields = [f for f in target_fields if not f.startswith("custom_")]
+            cust_type_ids = [f[len("custom_"):] for f in target_fields if f.startswith("custom_")]
+
+            del_custom = 0
+            del_att = 0
+
+            # 1-1. 선택된 커스텀 수당 삭제
+            if cust_type_ids:
+                placeholders = ",".join(["?"] * len(cust_type_ids))
+                if team and team != "전체":
+                    cursor.execute(f"""
+                        DELETE FROM daily_custom_attendance
+                        WHERE date = ? AND type_id IN ({placeholders})
+                          AND worker_id IN (SELECT worker_id FROM workers WHERE team = ?);
+                    """, [date_clean] + cust_type_ids + [team])
+                else:
+                    cursor.execute(f"""
+                        DELETE FROM daily_custom_attendance
+                        WHERE date = ? AND type_id IN ({placeholders});
+                    """, [date_clean] + cust_type_ids)
+                del_custom = cursor.rowcount
+
+            # 1-2. 선택된 기본 공수/수당 컬럼 0.0으로 초기화
+            allowed_std_cols = {
+                "normal_weight", "overtime_weight", "prev_month_missing", "deduction",
+                "weekly_holiday", "monthly_holiday", "lodging_weight", "health_weight", "leader_weight"
+            }
+            valid_std_fields = [f for f in std_fields if f in allowed_std_cols]
+            if valid_std_fields:
+                set_clauses = []
+                cond_clauses = []
+                for col in valid_std_fields:
+                    set_clauses.append(f"{col} = 0.0")
+                    cond_clauses.append(f"{col} != 0.0")
+                    if col == "weekly_holiday":
+                        set_clauses.append("is_weekly_manual = 0")
+                    elif col == "monthly_holiday":
+                        set_clauses.append("is_monthly_manual = 0")
+                    elif col == "normal_weight":
+                        set_clauses.append("status = CASE WHEN status = '출근' THEN '휴무' ELSE status END")
+                set_clauses.append("version = version + 1")
+
+                set_sql = ", ".join(set_clauses)
+                cond_sql = " OR ".join(cond_clauses)
+
+                if team and team != "전체":
+                    cursor.execute(f"""
+                        UPDATE daily_attendance
+                        SET {set_sql}
+                        WHERE date = ? AND ({cond_sql})
+                          AND worker_id IN (SELECT worker_id FROM workers WHERE team = ?);
+                    """, (date_clean, team))
+                else:
+                    cursor.execute(f"""
+                        UPDATE daily_attendance
+                        SET {set_sql}
+                        WHERE date = ? AND ({cond_sql});
+                    """, (date_clean,))
+                del_att = cursor.rowcount
+
+            # 모든 공수/수당 수치가 0.0이고 추가수당도 없는 빈 행('휴무') 정리
+            cursor.execute("""
+                DELETE FROM daily_attendance
+                WHERE date = ?
+                  AND normal_weight = 0.0 AND overtime_weight = 0.0
+                  AND lodging_weight = 0.0 AND health_weight = 0.0 AND leader_weight = 0.0
+                  AND weekly_holiday = 0.0 AND monthly_holiday = 0.0
+                  AND prev_month_missing = 0.0 AND deduction = 0.0
+                  AND status IN ('휴무', '')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM daily_custom_attendance c
+                      WHERE c.date = daily_attendance.date AND c.worker_id = daily_attendance.worker_id
+                  );
+            """, (date_clean,))
+
+            target_label = f"[{team}]" if (team and team != "전체") else "[전체]"
+            log_audit(
+                user_id=user_id,
+                worker_id=None,
+                action=f"{date_clean} 일자 {target_label} 선택 수당/공수 삭제 ({', '.join(target_fields)})",
+                before_value=f"기본항목 수정:{del_att}건, 추가수당 삭제:{del_custom}건",
+                after_value="0으로 초기화됨",
+                conn=conn
+            )
+            conn.commit()
+            return {"deleted_attendance": del_att, "deleted_custom": del_custom}
+
+        # 2. 해당 날짜 전체 데이터 일괄 삭제
+        if team and team != "전체":
+            cursor.execute("""
+                DELETE FROM daily_custom_attendance
+                WHERE date = ? AND worker_id IN (SELECT worker_id FROM workers WHERE team = ?);
+            """, (date_clean, team))
+            del_custom = cursor.rowcount
+
+            cursor.execute("""
+                DELETE FROM daily_attendance
+                WHERE date = ? AND worker_id IN (SELECT worker_id FROM workers WHERE team = ?);
+            """, (date_clean, team))
+            del_att = cursor.rowcount
+
+            log_audit(
+                user_id=user_id,
+                worker_id=None,
+                action=f"{date_clean} 일자 [{team}] 데이터 일괄 삭제",
+                before_value=f"출역:{del_att}건, 추가수당:{del_custom}건",
+                after_value="삭제됨",
+                conn=conn
+            )
+        else:
+            cursor.execute("DELETE FROM daily_custom_attendance WHERE date = ?;", (date_clean,))
+            del_custom = cursor.rowcount
+
+            cursor.execute("DELETE FROM daily_attendance WHERE date = ?;", (date_clean,))
+            del_att = cursor.rowcount
+
+            cursor.execute("DELETE FROM daily_input_checks WHERE date = ?;", (date_clean,))
+
+            log_audit(
+                user_id=user_id,
+                worker_id=None,
+                action=f"{date_clean} 일자 전체 데이터 일괄 삭제",
+                before_value=f"출역:{del_att}건, 추가수당:{del_custom}건",
+                after_value="삭제됨",
+                conn=conn
+            )
+
+        conn.commit()
+        return {"deleted_attendance": del_att, "deleted_custom": del_custom}
+    except Exception as e:
+        conn.rollback()
+        log_system_error(user_id, f"{date_clean} 일자 데이터 삭제 실패: {e}", traceback.format_exc(), conn=conn)
         raise e
     finally:
         conn.close()
